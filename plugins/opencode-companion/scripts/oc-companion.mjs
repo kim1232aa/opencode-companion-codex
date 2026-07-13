@@ -24,14 +24,14 @@ import { loadState, updateState, upsertJob, jobDataPath } from "./lib/state.mjs"
 import {
   buildStatusSnapshot,
   resolveResultJob,
-  resolveCancelableJob,
+  resolveCancelableJobs,
   enrichJob,
   reconcileStrandedJobs,
   recoverStrandedResults,
   isOwnedProcessAlive,
 } from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
-import { renderStatus, renderResult, renderReview, renderSetup, formatUsage } from "./lib/render.mjs";
+import { renderStatus, renderResult, renderReview, renderSetup, formatUsage, formatTrailer } from "./lib/render.mjs";
 import { buildTaskPrompt, buildReviewPrompt } from "./lib/prompts.mjs";
 import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
@@ -71,6 +71,33 @@ const logErr = (m) => {
 
 const text = (s) => ({ content: [{ type: "text", text: s }] });
 const errText = (s) => ({ content: [{ type: "text", text: s }], isError: true });
+
+// Compose the one-line result trailer appended to a delegate/review body. The
+// user complained the old multi-line tail was "十分冗长", so the default is now
+// formatTrailer's single concise line, with the Codex job id and OpenCode
+// session id folded in — Codex needs the job id to call oc_status/oc_result/
+// oc_cancel and the session id to resume via resumeSession. When usage is empty
+// the token/model part drops out, but a bare "✓ job:… · session:…" still carries
+// those ids. A model mismatch keeps formatTrailer's leading ⚠️ and its
+// ran-vs-requested spelling. Setting OPENCODE_COMPANION_VERBOSE_TRAILER=1 (the
+// same switch as the Claude Code frontend) restores the original multi-line
+// formatUsage block; the full breakdown also always remains available from
+// oc_result → renderResult, so no detail is lost by the concise default.
+export function buildResultTrailer(usage, { requestedModel, sessionId, jobId } = {}) {
+  const idBits = [];
+  if (jobId) idBits.push(`job:${jobId}`);
+  if (sessionId) idBits.push(`session:${sessionId}`);
+  if (/^(1|true|yes|on)$/i.test(process.env.OPENCODE_COMPANION_VERBOSE_TRAILER || "")) {
+    const parts = [];
+    const full = formatUsage(usage, { requestedModel });
+    if (full) parts.push(`---\n${full}`);
+    if (idBits.length) parts.push(`[${idBits.join(" · ")}]`);
+    return parts.length ? `\n${parts.join("\n")}` : "";
+  }
+  const base = formatTrailer(usage, { requestedModel });
+  if (base) return `\n${idBits.length ? `${base} · ${idBits.join(" · ")}` : base}`;
+  return idBits.length ? `\n✓ ${idBits.join(" · ")}` : "";
+}
 
 // requestId → { sessionId, jobId, workspace } for notifications/cancelled.
 const inflight = new Map();
@@ -160,11 +187,11 @@ const TOOLS = [
   },
   {
     name: "oc_cancel",
-    description: "Cancel a running OpenCode job: aborts its OpenCode session and marks the job canceled (never clobbers an already-finished result).",
+    description: "Cancel a running OpenCode job: aborts its OpenCode session and marks the job canceled (never clobbers an already-finished result). Omit 'job' to cancel ALL running/pending jobs in the current session.",
     inputSchema: {
       type: "object",
       properties: {
-        job: { type: "string", description: "Job id or unique prefix. Omit for the most recent running job." },
+        job: { type: "string", description: "Job id or unique prefix. Omit to cancel every running/pending job in the current session." },
         workspace: { type: "string", description: "Workspace path. Defaults to the server's cwd." },
       },
     },
@@ -307,12 +334,18 @@ async function handleDelegate(args, requestId) {
     // handled by the catch below, so a successful return here always carries
     // real text — no empty-output guard needed on this path.
     const lines = [result.rendered];
-    const usageLine = formatUsage(result.usage, { requestedModel: result.requestedModel });
-    if (usageLine) lines.push(`\n---\n${usageLine}`);
+    // One concise trailer line (job + session folded in so Codex can drive
+    // oc_status/oc_result/oc_cancel and resume); VERBOSE_TRAILER=1 restores the
+    // old multi-line breakdown. Changed files stay a separate block — useful.
+    const trailer = buildResultTrailer(result.usage, {
+      requestedModel: result.requestedModel,
+      sessionId: result.opencodeSessionId,
+      jobId: job.id,
+    });
+    if (trailer) lines.push(trailer);
     if (result.changedFiles?.length) {
       lines.push(`\nChanged files:\n${result.changedFiles.map((f) => `- ${f}`).join("\n")}`);
     }
-    lines.push(`\n[job ${job.id} · session ${result.opencodeSessionId} — resumable via resumeSession]`);
     return text(lines.join("\n"));
   } catch (err) {
     return errText(`Delegation failed (job ${job.id}): ${err.message}. If OpenCode kept running server-side, oc_result may still recover the answer.`);
@@ -409,43 +442,61 @@ async function handleResult(args) {
   return text(renderResult(enriched, resultData));
 }
 
-async function handleCancel(args) {
+export async function handleCancel(args) {
   const workspace = await resolveWorkspaceArg(args);
   const ref = typeof args.job === "string" && args.job.trim() ? args.job.trim() : undefined;
   if (ref && !/^[A-Za-z0-9._:-]+$/.test(ref)) {
     return errText("Error: invalid job reference.");
   }
   const jobs = reconcileStrandedJobs(workspace, loadState(workspace).jobs ?? []);
-  const { job, ambiguous } = resolveCancelableJob(jobs, ref, {});
-  if (ambiguous) return errText("Error: multiple running jobs — give a job id prefix.");
-  if (!job) return text("No active job to cancel.");
 
-  if (job.opencodeSessionId) {
-    try {
-      const client = createClient(defaultServerUrl(), { directory: workspace });
-      await client.abortSession(job.opencodeSessionId);
-    } catch { /* server may be down */ }
+  // No ref ⇒ cancel EVERY running/pending job for THIS Claude session
+  // (cancel-all), strictly session-scoped so another session's jobs are never
+  // touched. A ref still targets exactly that one job.
+  const { jobs: targets, ambiguous } = resolveCancelableJobs(jobs, ref, { sessionId: getClaudeSessionId() });
+  if (ambiguous) return errText("Error: multiple running jobs — give a job id prefix.");
+  if (!targets.length) return text("No active job to cancel.");
+
+  const client = createClient(defaultServerUrl(), { directory: workspace });
+  const canceled = [];
+  const alreadyDone = [];
+
+  for (const job of targets) {
+    // Abort the OpenCode session if we have one (returns its blocked sendPrompt).
+    if (job.opencodeSessionId) {
+      try {
+        await client.abortSession(job.opencodeSessionId);
+      } catch { /* server may be down */ }
+    }
+    // A detached worker only exists for jobs created by the sibling Claude Code
+    // frontend sharing this store; in-process delegations have none. Ownership is
+    // verified via the pid start-time fingerprint so a recycled pid is never hit.
+    if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
+      try { process.kill(job.pid, "SIGTERM"); } catch { /* race: gone */ }
+    }
+    // Compare-and-set INSIDE the state lock: the worker may reach a terminal
+    // status during the abort round-trip, and a check-then-write outside the lock
+    // could clobber that result with "canceled".
+    let finalStatus = null;
+    updateState(workspace, (state) => {
+      const j = state.jobs?.find((x) => x.id === job.id);
+      if (!j) return;
+      if (j.status !== "running" && j.status !== "pending") { finalStatus = j.status; return; }
+      j.status = "canceled";
+      j.completedAt = new Date().toISOString();
+      j.errorMessage = "Canceled by user";
+      j.updatedAt = new Date().toISOString();
+      finalStatus = "canceled";
+    });
+    if (finalStatus === "canceled") canceled.push(job.id);
+    else if (finalStatus) alreadyDone.push(`${job.id} (${finalStatus})`);
   }
-  // A detached worker only exists for jobs created by the sibling Claude Code
-  // frontend sharing this store; in-process delegations have none.
-  if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
-    try { process.kill(job.pid, "SIGTERM"); } catch { /* gone */ }
-  }
-  let finalStatus = null;
-  updateState(workspace, (state) => {
-    const j = state.jobs?.find((x) => x.id === job.id);
-    if (!j) return;
-    if (j.status !== "running" && j.status !== "pending") { finalStatus = j.status; return; }
-    j.status = "canceled";
-    j.completedAt = new Date().toISOString();
-    j.errorMessage = "Canceled by user";
-    j.updatedAt = new Date().toISOString();
-    finalStatus = "canceled";
-  });
-  if (finalStatus && finalStatus !== "canceled") {
-    return text(`Job ${job.id} already ${finalStatus}; nothing to cancel.`);
-  }
-  return text(`Canceled job: ${job.id}`);
+
+  const out = [];
+  if (canceled.length) out.push(`Canceled ${canceled.length} job${canceled.length === 1 ? "" : "s"}: ${canceled.join(", ")}`);
+  if (alreadyDone.length) out.push(`Already finished (not canceled): ${alreadyDone.join(", ")}`);
+  if (!out.length) return text("No active job to cancel.");
+  return text(out.join("\n"));
 }
 
 async function handleSetup() {
@@ -547,8 +598,16 @@ async function runReview(args, requestId, { adversarial }) {
     });
 
     const lines = [result.rendered];
-    const usageLine = formatUsage(result.usage, { requestedModel: result.requestedModel });
-    if (usageLine) lines.push(`\n---\n${usageLine}`);
+    // Same concise trailer as delegate. Reviews have no changed files; the
+    // session id rides along for follow-ups and the job id lets oc_result fetch
+    // the full findings later. VERBOSE_TRAILER=1 falls back to the multi-line
+    // formatUsage breakdown.
+    const trailer = buildResultTrailer(result.usage, {
+      requestedModel: result.requestedModel,
+      sessionId: result.opencodeSessionId,
+      jobId: job.id,
+    });
+    if (trailer) lines.push(trailer);
     return text(lines.join("\n"));
   } catch (err) {
     return errText(`${label} failed (job ${job.id}): ${err.message}. If OpenCode kept running server-side, oc_result may still recover the answer.`);

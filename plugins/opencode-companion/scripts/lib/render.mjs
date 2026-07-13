@@ -47,6 +47,21 @@ function liveSignal(progressPreview) {
   return { tokens, ageSec };
 }
 
+// Pull the last few "activity:" lines out of a running job's log tail — the
+// internal tool calls (bash/edit/read …) that dispatchWithRetry records — so
+// status can show what OpenCode is doing, not just a token count. Kept to a
+// small `max` so the preview never floods.
+function recentActivity(progressPreview, max = 2) {
+  if (typeof progressPreview !== "string" || !progressPreview) return [];
+  const lines = progressPreview.split("\n").filter(Boolean);
+  const acts = [];
+  for (let i = lines.length - 1; i >= 0 && acts.length < max; i--) {
+    const m = lines[i].match(/\bactivity:\s*(.+?)\s*$/);
+    if (m) acts.unshift(m[1]);
+  }
+  return acts;
+}
+
 const STATUS_ICON = {
   running: "🟢", pending: "🟡", completed: "✅", failed: "❌", canceled: "⛔",
 };
@@ -70,9 +85,11 @@ export function renderStatus(snapshot) {
       if (tokens) bits.push(`${tokens} tokens`);
       if (ageSec != null) bits.push(`updated ${ageSec}s ago${ageSec > 120 ? " ⚠️ possibly stuck" : ""}`);
       lines.push(`- ${bits.join(" · ")}`);
-      if (job.progressPreview) {
-        lines.push(`  > ${job.progressPreview.split("\n").join("\n  > ")}`);
-      }
+      // Show the last 1-2 internal tool calls (bash/edit/read …) instead of
+      // dumping the raw log tail — approximates a native subagent's visibility
+      // into what the delegate is running, without flooding the status view.
+      const acts = recentActivity(job.progressPreview, 2);
+      for (const a of acts) lines.push(`  ↳ ${a}`);
     }
     lines.push("");
     lines.push("_Tokens rising between two checks = generating. Same tokens + a large \"updated … ago\" = stuck. Failed/❌ or ⚠️ no-output = did not succeed._");
@@ -210,6 +227,40 @@ export function formatUsage(usage, opts = {}) {
     lines.push(`- **Model**: ${requested} (requested; server did not report which ran)`);
   }
   return lines.join("\n");
+}
+/**
+ * One-line result trailer for the immediate delegate/result stdout, e.g.
+ *   "✓ 1,234 out tok · model:glm-5.2 · session:abc123"
+ * so the tail is a single line instead of a multi-line block. Correctness
+ * signals are preserved: a model mismatch flips the leading mark to ⚠️ and
+ * spells out ran-vs-requested. The full multi-line breakdown still lives in
+ * formatUsage (shown by `/opencode:result`). Returns "" when nothing is worth
+ * showing.
+ * @param {object} [usage]
+ * @param {{ requestedModel?: string, sessionId?: string }} [opts]
+ * @returns {string}
+ */
+export function formatTrailer(usage, opts = {}) {
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const u = usage && typeof usage === "object" ? usage : {};
+  const out = num(u.output);
+  const total = num(u.total);
+  const cost = num(u.cost);
+  const observed = typeof u.model === "string" && u.model.trim() ? u.model.trim() : null;
+  const requested = typeof opts.requestedModel === "string" && opts.requestedModel.trim()
+    ? opts.requestedModel.trim() : null;
+  const mismatch = !!(observed && requested && observed !== requested);
+  const bits = [];
+  if (out) bits.push(`${out.toLocaleString()} out tok`);
+  else if (total) bits.push(`${total.toLocaleString()} tok`);
+  if (cost > 0) bits.push(`~$${cost.toFixed(4)}`);
+  if (mismatch) bits.push(`model ran ${observed} (NOT requested ${requested})`);
+  else if (observed) bits.push(`model:${observed}`);
+  else if (requested) bits.push(`model:${requested} (requested)`);
+  const sid = typeof opts.sessionId === "string" && opts.sessionId.trim() ? opts.sessionId.trim() : null;
+  if (sid) bits.push(`session:${sid}`);
+  if (!bits.length) return "";
+  return `${mismatch ? "⚠️" : "✓"} ${bits.join(" · ")}`;
 }
 /**
  * Render a review result (structured JSON output).

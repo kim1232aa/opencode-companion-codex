@@ -485,6 +485,29 @@ export function createClient(baseUrl, opts = {}) {
     },
 
     /**
+     * Fetch new tool-activity lines for a session — e.g. "bash: npm test",
+     * "edit: src/foo.mjs", "read: README.md" — so a progress poll can surface
+     * what OpenCode is actually running internally, not just a token count.
+     *
+     * Thin server wrapper over extractActivityLines(): pass a persistent `seen`
+     * Set across calls for incremental, de-duplicated output (a tool part is
+     * reported once), and `since` (epoch ms) to drop a resumed session's prior
+     * commands. Returns [] on any failure so a progress poll never throws.
+     * @param {string} sessionId
+     * @param {{ since?: number, seen?: Set<string>, maxLen?: number, timeoutMs?: number }} [opts]
+     * @returns {Promise<string[]>}
+     */
+    getSessionActivity: async (sessionId, opts = {}) => {
+      const timeoutMs = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : 300_000;
+      try {
+        const msgs = await request("GET", `/session/${sessionId}/message`, undefined, timeoutMs);
+        return extractActivityLines(msgs, { since: opts.since, seen: opts.seen, maxLen: opts.maxLen });
+      } catch {
+        return [];
+      }
+    },
+
+    /**
      * Send a prompt (synchronous / streaming).
      * Returns the full response text from SSE stream.
      */
@@ -599,6 +622,99 @@ export function suggestModelRefs(allRefs, requested, limit = 5) {
 }
 
 
+/**
+ * Pick the single most informative field out of a tool call's input, keyed by
+ * tool name (e.g. bash → the command, edit/read/write → the file path, grep →
+ * the pattern). Returns "" when nothing useful is present yet.
+ * @param {string} tool
+ * @param {Record<string, unknown>} input
+ * @returns {string}
+ */
+function toolActivityValue(tool, input) {
+  const t = String(tool).toLowerCase();
+  const firstString = (...keys) => {
+    for (const k of keys) {
+      const v = input[k];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    return "";
+  };
+  if (t === "bash" || t === "shell") return firstString("command", "cmd", "description");
+  if (t === "edit" || t === "write" || t === "read" || t === "patch" || t === "multiedit")
+    return firstString("filePath", "path", "file", "filename");
+  if (t === "grep" || t === "glob" || t === "search") return firstString("pattern", "query", "regex");
+  if (t === "list" || t === "ls") return firstString("path", "dir", "directory");
+  if (t === "webfetch" || t === "fetch") return firstString("url");
+  if (t === "task" || t === "agent") return firstString("description", "prompt", "title");
+  if (t === "todowrite" || t === "todoread") return "";
+  // Unknown tool: surface whichever common field carries the payload.
+  return firstString("command", "filePath", "path", "pattern", "query", "url", "description", "title");
+}
+
+/**
+ * Render a single OpenCode tool part as a short, one-line activity string, e.g.
+ *   "bash: npm test", "edit: src/foo.mjs", "read: README.md".
+ * Long commands are collapsed to a single line and truncated. An errored call
+ * gets a trailing " ✗". Returns "" when the part isn't a tool part, or is a
+ * still-pending call with nothing to show yet (so the caller can re-check it on
+ * a later poll once its input arrives).
+ * @param {object} part
+ * @param {{ maxLen?: number }} [opts]
+ * @returns {string}
+ */
+export function formatToolActivity(part, opts = {}) {
+  if (!part || part.type !== "tool") return "";
+  const maxLen = Number.isFinite(opts.maxLen) && opts.maxLen > 0 ? opts.maxLen : 100;
+  const tool = (String(part.tool ?? part.name ?? "").trim()) || "tool";
+  const state = part.state && typeof part.state === "object" ? part.state : {};
+  const input = state.input && typeof state.input === "object" ? state.input : {};
+  const status = typeof state.status === "string" ? state.status : "";
+  const value = toolActivityValue(tool, input);
+  // A pending call with nothing to show yet: skip so a later poll can catch it
+  // once the command/path is filled in.
+  if (!value && (status === "" || status === "pending")) return "";
+  let line = (value ? `${tool}: ${value}` : tool).replace(/\s+/g, " ").trim();
+  if (line.length > maxLen) line = line.slice(0, maxLen - 1).trimEnd() + "…";
+  return status === "error" ? `${line} ✗` : line;
+}
+
+/**
+ * Extract new tool-activity lines from a session's message list, in order.
+ * Pure (no I/O) so it unit-tests against mock messages.
+ *
+ * Incremental + de-duplicated: pass a persistent Set as opts.seen (keyed by
+ * tool-part id) across polls — only parts not seen before produce a line, and a
+ * part is only marked seen once it actually yields a line (a still-pending call
+ * stays un-seen until its input arrives). opts.since (epoch ms) drops tool parts
+ * from assistant turns older than the current dispatch, so a resumed session's
+ * prior commands don't replay.
+ * @param {any[]} messages
+ * @param {{ since?: number, seen?: Set<string>, maxLen?: number }} [opts]
+ * @returns {string[]}
+ */
+export function extractActivityLines(messages, opts = {}) {
+  const list = Array.isArray(messages) ? messages : [];
+  const since = typeof opts.since === "number" && opts.since > 0 ? opts.since : 0;
+  const seen = opts.seen instanceof Set ? opts.seen : null;
+  const out = [];
+  for (const m of list) {
+    const created = m?.info?.time?.created ?? 0;
+    // Missing timestamp under an active `since` filter ⇒ treat as pre-dispatch.
+    if (since && (!created || created < since)) continue;
+    const parts = Array.isArray(m?.parts) ? m.parts : [];
+    for (const p of parts) {
+      if (!p || p.type !== "tool") continue;
+      const id = p.id ?? p.callID ?? p.callId ?? null;
+      if (seen && id != null && seen.has(id)) continue;
+      const line = formatToolActivity(p, { maxLen: opts.maxLen });
+      if (!line) continue; // pending / no-input ⇒ leave un-seen for a later poll
+      if (seen && id != null) seen.add(id);
+      out.push(line);
+    }
+  }
+  return out;
+}
+
 const _delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -642,7 +758,22 @@ export async function dispatchWithRetry(opts) {
     let lastTotal = -1;
     let lastProgressAt = Date.now();
     let stalled = false;
+    // Per-attempt cursor for the internal activity stream: `seen` de-dupes tool
+    // parts across beats; `activitySince` drops a resumed session's old commands.
+    const activitySeen = new Set();
+    const activitySince = Date.now();
     const beat = setInterval(async () => {
+      // Surface OpenCode's internal tool calls (bash/edit/read …) so status can
+      // show what it is actually running, not just a token count. Logged BEFORE
+      // the heartbeat so the heartbeat stays the freshest line (age/token parse).
+      // Best-effort + guarded: an older client without getSessionActivity (or a
+      // fetch failure) simply logs no activity.
+      if (log && typeof client.getSessionActivity === "function") {
+        const acts = await client
+          .getSessionActivity(sessionId, { since: activitySince, seen: activitySeen, timeoutMs: 8_000 })
+          .catch(() => []);
+        for (const a of acts) log(`activity: ${a}`);
+      }
       const u = await client.getSessionUsage(sessionId, { timeoutMs: 8_000 }).catch(() => null);
       const total = u?.total ?? 0;
       // Heartbeat every beat (even at 0 tokens) so log freshness tracks liveness.

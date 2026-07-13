@@ -215,10 +215,12 @@ export function enrichJob(job, workspacePath) {
     enriched.elapsed = formatDuration(enriched.elapsedMs);
   }
 
-  // Progress preview from log tail
+  // Progress preview from log tail. Take a slightly deeper tail (not just 3
+  // lines) so a single beat's heartbeat AND its internal activity lines
+  // (bash/edit/read …) both land in the preview for status to surface.
   if (job.status === "running") {
     const logFile = jobLogPath(workspacePath, job.id);
-    const lines = tailLines(logFile, 3);
+    const lines = tailLines(logFile, 10);
     if (lines.length > 0) {
       enriched.progressPreview = lines.join("\n");
     }
@@ -338,6 +340,29 @@ export function resolveCancelableJob(jobs, ref, opts = {}) {
     return { job: scoped[0] ?? null, ambiguous: scoped.length > 1 };
   }
   return matchJobReference(running, ref);
+}
+
+/**
+ * Resolve every job that can be canceled — supports "cancel-all". With a `ref`,
+ * behaves like a single-job lookup (one job, or ambiguous). Without a ref,
+ * returns ALL running/pending jobs for this Claude session (scoped by
+ * opts.sessionId so another session's jobs are never touched); an unset
+ * sessionId falls back to all running jobs, matching the single-job resolver.
+ * @param {object[]} jobs
+ * @param {string} [ref]
+ * @param {{ sessionId?: string }} [opts]
+ * @returns {{ jobs: object[], ambiguous: boolean }}
+ */
+export function resolveCancelableJobs(jobs, ref, opts = {}) {
+  const running = jobs.filter((j) => j.status === "running" || j.status === "pending");
+  if (ref) {
+    const { job, ambiguous } = matchJobReference(running, ref);
+    return { jobs: job ? [job] : [], ambiguous };
+  }
+  const scoped = opts.sessionId
+    ? running.filter((j) => j.sessionId === opts.sessionId)
+    : running;
+  return { jobs: scoped, ambiguous: false };
 }
 
 /**
