@@ -30,14 +30,24 @@ import {
   recoverStrandedResults,
   isOwnedProcessAlive,
 } from "./lib/job-control.mjs";
-import { createJobRecord, runTrackedJob } from "./lib/tracked-jobs.mjs";
-import { renderStatus, renderResult, renderSetup, formatUsage } from "./lib/render.mjs";
-import { buildTaskPrompt } from "./lib/prompts.mjs";
+import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
+import { renderStatus, renderResult, renderReview, renderSetup, formatUsage } from "./lib/render.mjs";
+import { buildTaskPrompt, buildReviewPrompt } from "./lib/prompts.mjs";
+import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
 const SERVER_VERSION = "0.1.0";
 const PROTOCOL_VERSION = "2025-03-26";
+
+// Plugin root — the directory that holds prompts/ and schemas/. Reviews read
+// their prompt templates from here. The stdio server lives at
+// <root>/scripts/oc-companion.mjs, so the root is the parent of this file's dir.
+// An explicit env override wins so a relocated launch can still find templates.
+const PLUGIN_ROOT =
+  process.env.OPENCODE_COMPANION_PLUGIN_ROOT ||
+  process.env.CLAUDE_PLUGIN_ROOT ||
+  path.resolve(import.meta.dirname, "..");
 
 function defaultServerUrl() {
   const port = Number(process.env.OPENCODE_SERVER_PORT) || 4096;
@@ -163,6 +173,44 @@ const TOOLS = [
     name: "oc_setup",
     description: "Check whether OpenCode is installed, its server is reachable, and which providers are configured.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "oc_review",
+    description:
+      "Run a READ-ONLY code review of a workspace's changes on OpenCode (a cheap OpenAI-compatible backend) and BLOCK until it returns structured findings. Reviews the working-tree diff by default, or a branch diff when 'base' is given. Same no-polling rule as oc_delegate: this single call is the whole review.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        base: { type: "string", description: "Optional base branch/ref to diff against (e.g. 'main'). Omit to review uncommitted working-tree changes." },
+        model: { type: "string", description: "Optional provider/model ref (split on the FIRST slash). Omit for the provider default." },
+        workspace: { type: "string", description: "Absolute path of the repository to review. Defaults to the server's cwd." },
+      },
+    },
+  },
+  {
+    name: "oc_adversarial_review",
+    description:
+      "Run a READ-ONLY ADVERSARIAL code review on OpenCode — the reviewer actively tries to break confidence in the change (auth, data loss, race conditions, rollback/idempotency, version skew) and returns a terse ship/no-ship verdict with structured findings. BLOCKS until done. Use before merging risky changes; pass 'focus' to weight a specific concern.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        base: { type: "string", description: "Optional base branch/ref to diff against. Omit to review uncommitted working-tree changes." },
+        focus: { type: "string", description: "Optional focus area to weight heavily (e.g. 'concurrency', 'the migration path')." },
+        model: { type: "string", description: "Optional provider/model ref (split on the FIRST slash). Omit for the provider default." },
+        workspace: { type: "string", description: "Absolute path of the repository to review. Defaults to the server's cwd." },
+      },
+    },
+  },
+  {
+    name: "oc_resume_candidate",
+    description:
+      "Return the most recent resumable OpenCode task session for a workspace so a follow-up can continue it: { available, jobId, opencodeSessionId }. If available, pass opencodeSessionId as oc_delegate's resumeSession. Read-only lookup — does not start or contact a server.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace: { type: "string", description: "Workspace path. Defaults to the server's cwd." },
+      },
+    },
   },
 ];
 
@@ -419,6 +467,108 @@ async function handleSetup() {
   return text(renderSetup({ installed, version, serverRunning, providers }));
 }
 
+// ─── Review (read-only) ─────────────────────────────────────────────────────
+
+async function handleReview(args, requestId) {
+  return runReview(args, requestId, { adversarial: false });
+}
+
+async function handleAdversarialReview(args, requestId) {
+  return runReview(args, requestId, { adversarial: true });
+}
+
+// Shared review driver. Mirrors the Claude Code frontend's handleReview /
+// handleAdversarialReview but runs in-process on the 'plan' (read-only) agent
+// and returns MCP content, so it also shows up in oc_status/oc_result.
+async function runReview(args, requestId, { adversarial }) {
+  if (args.model !== undefined && (typeof args.model !== "string" || !args.model.trim())) {
+    return errText("Error: model, if supplied, must be a non-empty provider/model string.");
+  }
+  let base;
+  if (args.base !== undefined) {
+    if (typeof args.base !== "string" || !args.base.trim()) {
+      return errText("Error: base, if supplied, must be a non-empty branch/ref string.");
+    }
+    try {
+      base = assertSafeRef(args.base);
+    } catch {
+      return errText("Error: invalid base ref (only branch/tag/commit-ref characters are allowed).");
+    }
+  }
+  const focus = adversarial && typeof args.focus === "string" && args.focus.trim() ? args.focus.trim() : undefined;
+  const workspace = await resolveWorkspaceArg(args);
+  const type = adversarial ? "adversarial-review" : "review";
+  const label = adversarial ? "Adversarial review" : "Review";
+  const job = createJobRecord(workspace, type, { base, focus, model: args.model });
+
+  try {
+    const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
+      report("starting", "Connecting to OpenCode server...");
+      const client = await connect({ cwd: workspace });
+
+      // Prompt is built from the repo's git diff/status; the adversarial variant
+      // reads its template from PLUGIN_ROOT/prompts/adversarial-review.md.
+      const prompt = await buildReviewPrompt(workspace, { base, adversarial, focus }, PLUGIN_ROOT);
+
+      report("reviewing", adversarial ? "Running adversarial review..." : "Running review...");
+      log(`Prompt: ${prompt.length} chars${focus ? `, focus: ${focus}` : ""}${args.model ? `, model: ${args.model}` : ""}`);
+
+      // Retry a transient 500 / empty turn / hang on a fresh session; the
+      // read-only 'plan' agent guarantees the review never edits the repo.
+      const dispatch = await dispatchWithRetry({
+        client,
+        prompt,
+        agent: "plan",
+        model: args.model,
+        extract: extractResponseText,
+        log,
+        makeSession: () => client.createSession({ title: `${label} ${job.id}` }),
+        onSession: (sid) => {
+          upsertJob(workspace, { id: job.id, opencodeSessionId: sid });
+          if (requestId !== undefined) inflight.set(requestId, { sessionId: sid, jobId: job.id, workspace });
+        },
+      });
+      const response = dispatch.response;
+      const sessionId = dispatch.sessionId;
+      if (dispatch.attempts > 1) log(`Succeeded on attempt ${dispatch.attempts}.`);
+
+      report("finalizing", "Processing review output...");
+      const bodyText = extractResponseText(response);
+      const structured = tryParseJson(bodyText);
+      const usage = await client.getSessionUsage(sessionId).catch(() => null);
+
+      return {
+        rendered: structured ? renderReview(structured) : bodyText,
+        structured,
+        usage,
+        opencodeSessionId: sessionId,
+        requestedModel: args.model,
+      };
+    });
+
+    const lines = [result.rendered];
+    const usageLine = formatUsage(result.usage, { requestedModel: result.requestedModel });
+    if (usageLine) lines.push(`\n---\n${usageLine}`);
+    return text(lines.join("\n"));
+  } catch (err) {
+    return errText(`${label} failed (job ${job.id}): ${err.message}. If OpenCode kept running server-side, oc_result may still recover the answer.`);
+  } finally {
+    if (requestId !== undefined) inflight.delete(requestId);
+  }
+}
+
+// ─── Resume candidate ───────────────────────────────────────────────────────
+
+async function handleResumeCandidate(args) {
+  const workspace = await resolveWorkspaceArg(args);
+  const jobs = loadState(workspace).jobs ?? [];
+  const candidate = pickResumeCandidate(jobs, getClaudeSessionId());
+  const head = candidate.available
+    ? `Resumable OpenCode session found — pass resumeSession: "${candidate.opencodeSessionId}" to oc_delegate to continue it (job ${candidate.jobId}).`
+    : "No resumable OpenCode task session for this workspace.";
+  return text(`${head}\n\n${JSON.stringify(candidate)}`);
+}
+
 const HANDLERS = {
   oc_delegate: handleDelegate,
   oc_delegate_batch: handleDelegateBatch,
@@ -426,6 +576,9 @@ const HANDLERS = {
   oc_result: handleResult,
   oc_cancel: handleCancel,
   oc_setup: handleSetup,
+  oc_review: handleReview,
+  oc_adversarial_review: handleAdversarialReview,
+  oc_resume_candidate: handleResumeCandidate,
 };
 
 // ─── Response text extraction (mirrors the Claude Code frontend) ────────────
@@ -451,6 +604,60 @@ function extractResponseText(response) {
     }
   }
   return JSON.stringify(response, null, 2);
+}
+
+// ─── Structured-output parsing (mirrors the Claude Code frontend) ───────────
+
+// Best-effort recovery of a JSON review payload from a model's text response:
+// prefer a ```json-tagged fence, then any fence, then the first {...}/[...]
+// span, then the whole string. Returns the parsed value or null.
+export function tryParseJson(text) {
+  if (typeof text !== "string") return null;
+  const candidates = [];
+
+  // All fenced blocks — prefer ```json-tagged ones, then any fenced block.
+  const fences = [...text.matchAll(/```(json)?\s*\n([\s\S]*?)```/g)];
+  for (const m of fences) {
+    if (m[1]) candidates.push(m[2]); // json-tagged first
+  }
+  for (const m of fences) {
+    if (!m[1]) candidates.push(m[2]);
+  }
+  // Bare object/array spanning the first "{"/"[" to the last "}"/"]".
+  const braceStart = text.search(/[[{]/);
+  if (braceStart !== -1) {
+    const braceEnd = Math.max(text.lastIndexOf("}"), text.lastIndexOf("]"));
+    if (braceEnd > braceStart) candidates.push(text.slice(braceStart, braceEnd + 1));
+  }
+  candidates.push(text); // last resort: the whole thing
+
+  for (const c of candidates) {
+    try {
+      return JSON.parse(c.trim());
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+// ─── Resume-candidate selection (mirrors the Claude Code frontend) ──────────
+
+// Pick the most recent resumable OpenCode task session from a job list: a
+// completed/running "task" job that carries an opencodeSessionId. When a
+// sessionId is supplied, restrict to that owner's jobs; otherwise consider all
+// (Codex runs typically have no session id, so this scans the whole workspace).
+export function pickResumeCandidate(jobs, sessionId) {
+  const lastTask = (jobs ?? [])
+    .filter((j) => j && j.type === "task" && j.opencodeSessionId)
+    .filter((j) => j.status === "completed" || j.status === "running")
+    .filter((j) => !sessionId || j.sessionId === sessionId)
+    .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))[0];
+  return {
+    available: !!lastTask,
+    jobId: lastTask?.id ?? null,
+    opencodeSessionId: lastTask?.opencodeSessionId ?? null,
+  };
 }
 
 // ─── Message dispatch ───────────────────────────────────────────────────────

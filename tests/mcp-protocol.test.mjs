@@ -76,14 +76,56 @@ describe("oc-companion MCP server", () => {
     srv.notify("notifications/initialized", {});
   });
 
-  it("lists the six tools with schemas", async () => {
+  it("lists all nine tools with schemas", async () => {
     const res = await srv.call("tools/list", {});
     const names = res.result.tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ["oc_cancel", "oc_delegate", "oc_delegate_batch", "oc_result", "oc_setup", "oc_status"]);
+    assert.deepEqual(names, [
+      "oc_adversarial_review",
+      "oc_cancel",
+      "oc_delegate",
+      "oc_delegate_batch",
+      "oc_result",
+      "oc_resume_candidate",
+      "oc_review",
+      "oc_setup",
+      "oc_status",
+    ]);
     const delegate = res.result.tools.find((t) => t.name === "oc_delegate");
     assert.deepEqual(delegate.inputSchema.required, ["task"]);
     const batch = res.result.tools.find((t) => t.name === "oc_delegate_batch");
     assert.deepEqual(batch.inputSchema.required, ["tasks"]);
+    // Reviews take only optional params (no required), and expose base/model.
+    const review = res.result.tools.find((t) => t.name === "oc_review");
+    assert.equal(review.inputSchema.required, undefined);
+    assert.ok(review.inputSchema.properties.base && review.inputSchema.properties.model);
+    const adv = res.result.tools.find((t) => t.name === "oc_adversarial_review");
+    assert.ok(adv.inputSchema.properties.focus, "adversarial review exposes a focus param");
+    const resume = res.result.tools.find((t) => t.name === "oc_resume_candidate");
+    assert.ok(resume.inputSchema.properties.workspace);
+  });
+
+  it("oc_review rejects a bad model and an unsafe base without touching a server", async () => {
+    const badModel = await srv.call("tools/call", { name: "oc_review", arguments: { model: "  " } });
+    assert.equal(badModel.result.isError, true);
+    assert.match(badModel.result.content[0].text, /model/);
+    // An unsafe base ref must be rejected by validation, not shelled out to git.
+    const badBase = await srv.call("tools/call", { name: "oc_review", arguments: { base: "main; rm -rf /" } });
+    assert.equal(badBase.result.isError, true);
+    assert.match(badBase.result.content[0].text, /invalid base ref/);
+  });
+
+  it("oc_adversarial_review rejects an empty base string", async () => {
+    const res = await srv.call("tools/call", { name: "oc_adversarial_review", arguments: { base: "   " } });
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /base/);
+  });
+
+  it("oc_resume_candidate reports nothing to resume for an empty workspace", async () => {
+    const res = await srv.call("tools/call", { name: "oc_resume_candidate", arguments: {} });
+    assert.equal(res.result.isError, undefined);
+    assert.match(res.result.content[0].text, /No resumable OpenCode task session/);
+    // The machine-readable JSON payload is appended for the model to parse.
+    assert.match(res.result.content[0].text, /"available":false/);
   });
 
   it("oc_delegate_batch validates its tasks array", async () => {
