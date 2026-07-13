@@ -30,8 +30,62 @@ export async function buildReviewPrompt(cwd, opts, pluginRoot) {
     systemPrompt = buildStandardReviewPrompt(diff, status, changedFiles, opts);
   }
 
-  return systemPrompt;
+  return systemPrompt + buildSchemaBlock(pluginRoot);
 }
+
+/**
+ * Append the actual review-output JSON Schema as an explicit output contract.
+ * Both review prompts tell the model to return JSON "matching the schema"; this
+ * appends the real schema so that instruction is backed by something concrete.
+ * Best-effort: falls back to a compact inline shape when the schema file can't
+ * be read, so a review still gets a usable contract.
+ * @param {string} pluginRoot
+ * @returns {string}
+ */
+export function buildSchemaBlock(pluginRoot) {
+  let schemaText;
+  try {
+    schemaText = fs
+      .readFileSync(path.join(pluginRoot, "schemas", "review-output.schema.json"), "utf8")
+      .trim();
+  } catch {
+    schemaText = FALLBACK_REVIEW_SCHEMA;
+  }
+  return `\n\n<output_schema>\nReturn ONLY a single JSON object conforming to this JSON Schema. No prose, no markdown, no code fences.\n${schemaText}\n</output_schema>`;
+}
+
+const FALLBACK_REVIEW_SCHEMA = JSON.stringify(
+  {
+    type: "object",
+    required: ["verdict", "summary", "findings"],
+    properties: {
+      verdict: { enum: ["approve", "needs-attention"] },
+      summary: { type: "string" },
+      findings: {
+        type: "array",
+        items: {
+          type: "object",
+          required: [
+            "file", "line_start", "line_end", "severity",
+            "title", "body", "confidence", "recommendation",
+          ],
+          properties: {
+            file: { type: "string" },
+            line_start: { type: "integer" },
+            line_end: { type: "integer" },
+            severity: { enum: ["critical", "high", "medium", "low"] },
+            title: { type: "string" },
+            body: { type: "string" },
+            confidence: { type: "number", minimum: 0, maximum: 1 },
+            recommendation: { type: "string" },
+          },
+        },
+      },
+    },
+  },
+  null,
+  2,
+);
 
 /**
  * Build a standard (non-adversarial) review prompt.
