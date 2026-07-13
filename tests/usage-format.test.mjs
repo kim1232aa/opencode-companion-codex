@@ -58,3 +58,23 @@ describe("formatUsage", () => {
     assert.ok(!out.includes("Token Usage"), out);
   });
 });
+describe("formatUsage — observed model reporting", () => {
+  it("shows the model that actually ran", () => {
+    const out = formatUsage({ total: 100, input: 100, model: "prov/glm-5.2" });
+    assert.match(out, /\*\*Model\*\*: prov\/glm-5\.2/);
+  });
+  it("warns when observed differs from requested", () => {
+    const out = formatUsage({ total: 100, input: 100, model: "prov/ark" }, { requestedModel: "prov/glm-5.2" });
+    assert.match(out, /⚠️/);
+    assert.match(out, /ran `prov\/ark`/);
+    assert.match(out, /NOT the requested `prov\/glm-5\.2`/);
+  });
+  it("no warning when observed matches requested", () => {
+    const out = formatUsage({ total: 100, input: 100, model: "prov/glm" }, { requestedModel: "prov/glm" });
+    assert.ok(!out.includes("⚠️"), out);
+  });
+  it("marks provider-default when no model was requested", () => {
+    const out = formatUsage({ total: 100, input: 100, model: "prov/ark" });
+    assert.match(out, /\(provider default\)/);
+  });
+});

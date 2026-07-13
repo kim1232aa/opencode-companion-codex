@@ -384,7 +384,7 @@ export function createClient(baseUrl, opts = {}) {
       try {
         const msgs = await request("GET", `/session/${sessionId}/message`, undefined, timeoutMs);
         const list = Array.isArray(msgs) ? msgs : [];
-        const acc = { total: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+        const acc = { total: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, model: null };
         for (const m of list) {
           const info = m?.info;
           if (!info || info.role !== "assistant") continue;
@@ -408,6 +408,11 @@ export function createClient(baseUrl, opts = {}) {
           const cost = Number(info.cost);
           if (Number.isFinite(cost)) acc.cost += cost;
           acc.turns += 1;
+          // Record the model that ACTUALLY ran (last assistant turn wins), so
+          // callers can report requested-vs-observed and catch a silent default.
+          if (info.providerID && info.modelID) {
+            acc.model = `${info.providerID}/${info.modelID}`;
+          }
         }
         return acc;
       } catch {

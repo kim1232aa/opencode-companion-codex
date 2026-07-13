@@ -232,12 +232,12 @@ async function handleDelegate(args, requestId) {
         }
 
         report("finalizing", "Done");
-        return { rendered: bodyText, usage, changedFiles, summary: bodyText.slice(0, 500), opencodeSessionId: sessionId };
+        return { rendered: bodyText, usage, changedFiles, summary: bodyText.slice(0, 500), opencodeSessionId: sessionId, requestedModel: args.model };
       })
     );
 
     const lines = [result.rendered];
-    const usageLine = formatUsage(result.usage);
+    const usageLine = formatUsage(result.usage, { requestedModel: result.requestedModel });
     if (usageLine) lines.push(`\n---\n${usageLine}`);
     if (result.changedFiles?.length) {
       lines.push(`\nChanged files:\n${result.changedFiles.map((f) => `- ${f}`).join("\n")}`);

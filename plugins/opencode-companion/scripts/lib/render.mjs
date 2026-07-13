@@ -98,7 +98,7 @@ export function renderResult(job, resultData) {
  * @param {object} [usage]
  * @returns {string}
  */
-export function formatUsage(usage) {
+export function formatUsage(usage, opts = {}) {
   if (!usage || typeof usage !== "object") return "";
   const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
   const total = num(usage.total);
@@ -120,7 +120,23 @@ export function formatUsage(usage) {
   if (breakdown.length) parts[0] += ` (${breakdown.join(", ")})`;
   if (turns) parts.push(`${turns} turn${turns === 1 ? "" : "s"}`);
   if (cost > 0) parts.push(`~$${cost.toFixed(4)}`);
-  return `- ${parts.join(" · ")}`;
+  const lines = [`- ${parts.join(" · ")}`];
+  // Requested-vs-observed model: show what ACTUALLY ran, and warn loudly when it
+  // differs from what the caller asked for (a silent default / alias would
+  // otherwise be invisible). opts.requestedModel is the ref passed to --model.
+  const observed = typeof usage.model === "string" ? usage.model : null;
+  const requested = typeof opts.requestedModel === "string" && opts.requestedModel.trim()
+    ? opts.requestedModel.trim() : null;
+  if (observed) {
+    if (requested && requested !== observed) {
+      lines.push(`- ⚠️ **Model**: ran \`${observed}\` — NOT the requested \`${requested}\``);
+    } else {
+      lines.push(`- **Model**: ${observed}${requested ? "" : " (provider default)"}`);
+    }
+  } else if (requested) {
+    lines.push(`- **Model**: ${requested} (requested; server did not report which ran)`);
+  }
+  return lines.join("\n");
 }
 /**
  * Render a review result (structured JSON output).
