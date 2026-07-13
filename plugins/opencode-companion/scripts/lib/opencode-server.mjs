@@ -597,3 +597,109 @@ export function suggestModelRefs(allRefs, requested, limit = 5) {
   scored.sort((a, b) => b[0] - a[0] || a[1].length - b[1].length);
   return scored.slice(0, limit).map(([, r]) => r);
 }
+
+
+const _delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Dispatch a prompt to OpenCode with automatic retries — but only for the
+ * failure modes that are actually TRANSIENT:
+ *
+ *   • sendPrompt throws (an occasional 500, a dropped connection) → RETRY.
+ *   • the session STALLS (no token progress for stallMs; the watchdog aborts
+ *     it) → RETRY, because a hang is intermittent. An aborted stall counts as a
+ *     stall even if sendPrompt then resolves EMPTY or rejects — the `stalled`
+ *     flag, not the response, is what classifies it.
+ *   • the model returns but its text is EMPTY on a NON-stalled turn → do NOT
+ *     retry. An empty turn is usually DETERMINISTIC (this model won't answer
+ *     this prompt); retrying only re-burns the cached input. Fail immediately
+ *     and honestly, spelling out the OUTPUT-token truth so a big cached "total"
+ *     isn't mistaken for real work.
+ *
+ * Attempt 1 may reuse resumeSessionId; every retry starts a FRESH session (a
+ * wedged/errored session won't self-heal). A single interval both logs the
+ * token heartbeat (every beat, even at 0 tokens) and trips the stall watchdog.
+ *
+ * @returns {Promise<{ response:any, sessionId:string, attempts:number, empty:false }>}
+ * @throws on exhausted transport retries, on all-stalled attempts, or on an
+ *   empty (non-stalled) turn.
+ */
+export async function dispatchWithRetry(opts) {
+  const {
+    client, prompt, agent, model, extract, log,
+    makeSession, resumeSessionId, onSession,
+    maxAttempts = 3, stallMs = 120_000, beatMs = 30_000, backoffMs = 1500,
+  } = opts;
+  const stallReason = `no token progress for ${Math.round(stallMs / 1000)}s (stalled)`;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const retrying = attempt < maxAttempts;
+    let sessionId;
+    if (attempt === 1 && resumeSessionId) sessionId = resumeSessionId;
+    else sessionId = (await makeSession(attempt)).id;
+    onSession?.(sessionId, attempt);
+
+    let lastTotal = -1;
+    let lastProgressAt = Date.now();
+    let stalled = false;
+    const beat = setInterval(async () => {
+      const u = await client.getSessionUsage(sessionId, { timeoutMs: 8_000 }).catch(() => null);
+      const total = u?.total ?? 0;
+      // Heartbeat every beat (even at 0 tokens) so log freshness tracks liveness.
+      if (log) {
+        log(total > 0
+          ? `heartbeat: ${total.toLocaleString()} tokens so far (${u?.turns ?? "?"} turn${u?.turns === 1 ? "" : "s"})`
+          : `heartbeat: connected, 0 tokens yet (model has not emitted)`);
+      }
+      if (total > lastTotal) { lastTotal = total; lastProgressAt = Date.now(); }
+      else if (Date.now() - lastProgressAt >= stallMs) {
+        stalled = true;
+        clearInterval(beat);
+        client.abortSession(sessionId).catch(() => {}); // unblocks sendPrompt
+      }
+    }, beatMs);
+    beat.unref?.();
+
+    let response;
+    let threw = null;
+    try {
+      response = await client.sendPrompt(sessionId, prompt, { agent, model });
+    } catch (err) {
+      threw = err;
+    }
+    clearInterval(beat);
+
+    // (1) STALL — the watchdog aborted this turn. Retryable hang. Takes
+    // priority over both the thrown error and an empty body, since an abort can
+    // surface as either.
+    if (stalled) {
+      lastErr = new Error(stallReason);
+      if (log) log(`attempt ${attempt}/${maxAttempts}: stalled (${stallReason})${retrying ? " — retrying with a fresh session" : ""}`);
+      if (retrying) { await _delay(backoffMs * attempt); continue; }
+      throw new Error(`Stalled (no token progress) on every one of ${maxAttempts} attempts.`);
+    }
+
+    // (2) TRANSPORT error (a non-stall throw) — retryable transient.
+    if (threw) {
+      lastErr = threw;
+      if (log) log(`attempt ${attempt}/${maxAttempts} failed: ${threw.message}${retrying ? " — retrying with a fresh session" : ""}`);
+      if (retrying) { await _delay(backoffMs * attempt); continue; }
+      throw new Error(`Delegation failed after ${maxAttempts} attempts. Last error: ${threw.message}`);
+    }
+
+    // (3) EMPTY on a non-stalled turn — deterministic-looking, do NOT retry.
+    const outText = (typeof extract === "function" ? extract(response) : "") || "";
+    if (!outText.trim()) {
+      const u = await client.getSessionUsage(sessionId, { timeoutMs: 8_000 }).catch(() => null);
+      const tokNote = u
+        ? ` Only ${(u.output ?? 0).toLocaleString()} output tokens were generated — the ${(u.total ?? 0).toLocaleString()} total is cached input context, not new work.`
+        : "";
+      if (log) log(`attempt ${attempt}/${maxAttempts}: empty output — not retrying (looks deterministic)`);
+      throw new Error(`The model produced no output (empty response).${tokNote} Not retried (looks deterministic); try a different model or rephrase.`);
+    }
+
+    // (4) SUCCESS.
+    return { response, sessionId, attempts: attempt, empty: false };
+  }
+  throw lastErr;
+}

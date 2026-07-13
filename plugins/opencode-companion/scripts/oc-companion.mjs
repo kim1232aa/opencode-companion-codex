@@ -16,7 +16,7 @@ import process from "node:process";
 import readline from "node:readline";
 
 import { isOpencodeInstalled, getOpencodeVersion } from "./lib/process.mjs";
-import { isServerRunning, connect, createClient, suggestModelRefs } from "./lib/opencode-server.mjs";
+import { isServerRunning, connect, createClient, suggestModelRefs, dispatchWithRetry } from "./lib/opencode-server.mjs";
 import { loadState, updateState, upsertJob, jobDataPath } from "./lib/state.mjs";
 import {
   buildStatusSnapshot,
@@ -209,46 +209,29 @@ async function handleDelegate(args, requestId) {
           }
         }
 
-        let sessionId;
-        if (resumeSessionId) {
-          sessionId = resumeSessionId;
-          report("starting", `Resuming session ${sessionId}...`);
-        } else {
-          const session = await client.createSession({ title: `Codex delegate ${job.id}` });
-          sessionId = session.id;
-          report("starting", `Created session ${sessionId}`);
-        }
-        upsertJob(workspace, { id: job.id, opencodeSessionId: sessionId });
-        if (requestId !== undefined) inflight.set(requestId, { sessionId, jobId: job.id, workspace });
-
         const prompt = buildTaskPrompt(task, { write: isWrite });
         report("investigating", "Running task...");
         log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars, Model: ${args.model ?? "(provider default)"}`);
 
-        // Token-progress heartbeat: lets oc_status distinguish "generating"
-        // (tokens climbing) from "stuck" (frozen) during a long blocking run.
-        const heartbeat = setInterval(async () => {
-          const u = await client.getSessionUsage(sessionId, { timeoutMs: 8_000 }).catch(() => null);
-          // Log EVERY beat (even at 0 tokens) so the job log's freshness tracks
-          // worker liveness: fresh + 0 tokens = connected but the model hasn't
-          // emitted yet (a hung/silent turn); STALE = the worker itself is gone.
-          if (u) {
-            log(u.total > 0
-              ? `heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`
-              : `heartbeat: connected, 0 tokens yet (model has not emitted)`);
-          }
-        }, 30_000);
-        heartbeat.unref?.();
-
-        let response;
-        try {
-          response = await client.sendPrompt(sessionId, prompt, {
-            agent: agentName,
-            model: args.model,
-          });
-        } finally {
-          clearInterval(heartbeat);
-        }
+        // Dispatch with retries: a transient 500, an empty turn, or a hang (no
+        // token progress) is retried on a fresh session instead of failing.
+        const dispatch = await dispatchWithRetry({
+          client,
+          prompt,
+          agent: agentName,
+          model: args.model,
+          extract: extractResponseText,
+          log,
+          resumeSessionId,
+          makeSession: () => client.createSession({ title: `Codex delegate ${job.id}` }),
+          onSession: (sid) => {
+            upsertJob(workspace, { id: job.id, opencodeSessionId: sid });
+            if (requestId !== undefined) inflight.set(requestId, { sessionId: sid, jobId: job.id, workspace });
+          },
+        });
+        const response = dispatch.response;
+        const sessionId = dispatch.sessionId;
+        if (dispatch.attempts > 1) log(`Succeeded on attempt ${dispatch.attempts}.`);
 
         const bodyText = extractResponseText(response);
         const usage = await client.getSessionUsage(sessionId).catch(() => null);
@@ -266,13 +249,10 @@ async function handleDelegate(args, requestId) {
       })
     );
 
-    // A run can finish with no usable text (some models return an empty turn) —
-    // say so loudly instead of returning a blank success, so the caller doesn't
-    // mistake "completed" for "succeeded".
-    const producedText = typeof result.rendered === "string" && result.rendered.trim();
-    const lines = [producedText
-      ? result.rendered
-      : "⚠️ The delegated run COMPLETED but the model produced NO usable output (empty response). This is NOT a successful result — try a different model or rephrase the task."];
+    // An empty (non-stalled) turn now throws inside dispatchWithRetry and is
+    // handled by the catch below, so a successful return here always carries
+    // real text — no empty-output guard needed on this path.
+    const lines = [result.rendered];
     const usageLine = formatUsage(result.usage, { requestedModel: result.requestedModel });
     if (usageLine) lines.push(`\n---\n${usageLine}`);
     if (result.changedFiles?.length) {
