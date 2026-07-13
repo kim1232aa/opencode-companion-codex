@@ -13,7 +13,10 @@ const SESSION_ID_ENV = "OPENCODE_COMPANION_SESSION_ID";
  * @returns {string|undefined}
  */
 export function getClaudeSessionId() {
-  return process.env[SESSION_ID_ENV] || process.env.CLAUDE_SESSION_ID;
+  // Claude Code exposes the live session id as CLAUDE_CODE_SESSION_ID (NOT the
+  // non-existent CLAUDE_SESSION_ID); the OPENCODE_COMPANION_SESSION_ID override
+  // still wins when present.
+  return process.env[SESSION_ID_ENV] || process.env.CLAUDE_CODE_SESSION_ID;
 }
 
 /**

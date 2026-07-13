@@ -14,9 +14,12 @@
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { isOpencodeInstalled, getOpencodeVersion } from "./lib/process.mjs";
-import { isServerRunning, connect, createClient, suggestModelRefs, dispatchWithRetry } from "./lib/opencode-server.mjs";
+import { isServerRunning, ensureServer, connect, createClient, suggestModelRefs, dispatchWithRetry } from "./lib/opencode-server.mjs";
+import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, jobDataPath } from "./lib/state.mjs";
 import {
   buildStatusSnapshot,
@@ -64,11 +67,14 @@ const inflight = new Map();
 
 // ─── Workspace ──────────────────────────────────────────────────────────────
 
-function resolveWorkspaceArg(args) {
-  const ws = typeof args.workspace === "string" && args.workspace.trim()
-    ? path.resolve(args.workspace.trim())
-    : process.cwd();
-  return ws;
+export async function resolveWorkspaceArg(args) {
+  // An explicit workspace is taken verbatim (resolved to absolute). Otherwise,
+  // fall back to git-root detection so a call from a subdirectory keys state to
+  // the repository root instead of splintering state per-subdir.
+  if (typeof args.workspace === "string" && args.workspace.trim()) {
+    return path.resolve(args.workspace.trim());
+  }
+  return resolveWorkspace();
 }
 
 // ─── Tool definitions ───────────────────────────────────────────────────────
@@ -171,7 +177,7 @@ async function handleDelegate(args, requestId) {
   const agentName = args.agent === "plan" ? "plan" : "build";
   const isWrite = agentName !== "plan";
   const useWorktree = !!args.worktree && isWrite;
-  const workspace = resolveWorkspaceArg(args);
+  const workspace = await resolveWorkspaceArg(args);
   const resumeSessionId = typeof args.resumeSession === "string" && args.resumeSession.trim()
     ? args.resumeSession.trim()
     : null;
@@ -246,7 +252,7 @@ async function handleDelegate(args, requestId) {
 
         report("finalizing", "Done");
         return { rendered: bodyText, usage, changedFiles, summary: bodyText.slice(0, 500), opencodeSessionId: sessionId, requestedModel: args.model };
-      })
+      }, log)
     );
 
     // An empty (non-stalled) turn now throws inside dispatchWithRetry and is
@@ -267,7 +273,12 @@ async function handleDelegate(args, requestId) {
   }
 }
 
-async function handleDelegateBatch(args, requestId) {
+export async function handleDelegateBatch(args, requestId, deps = {}) {
+  // Injectable seams keep the fan-out orchestration unit-testable without a
+  // live server; production passes nothing and gets the real implementations.
+  const ensureServerFn = deps.ensureServer ?? ensureServer;
+  const runDelegate = deps.handleDelegate ?? handleDelegate;
+
   const tasks = Array.isArray(args.tasks) ? args.tasks : null;
   if (!tasks || tasks.length === 0) {
     return errText("Error: tasks must be a non-empty array of { task, model?, agent?, worktree?, label? }.");
@@ -279,12 +290,22 @@ async function handleDelegateBatch(args, requestId) {
   }
   const workspace = typeof args.workspace === "string" ? args.workspace : undefined;
 
+  // Warm the OpenCode server exactly once BEFORE fanning out. Each handleDelegate
+  // otherwise calls connect()→ensureServer() concurrently; on a cold start they
+  // all race to spawn `opencode serve` on the same port and every loser dies with
+  // an earlyExit error. Pre-warming serializes only that first spawn — when the
+  // server is already up this is a single cheap liveness check with no added
+  // latency, and its failure is swallowed so each task still surfaces its own
+  // error instead of the batch throwing.
+  const warmCwd = await resolveWorkspaceArg({ workspace }).catch(() => workspace);
+  await ensureServerFn({ cwd: warmCwd }).catch(() => {});
+
   // Run every task concurrently, each as its own tracked job + OpenCode
   // session. handleDelegate never rejects (errors come back as errText), so
   // one failed task cannot take down its siblings.
   const results = await Promise.all(
     tasks.map((t, i) =>
-      handleDelegate(
+      runDelegate(
         { task: t.task, model: t.model, agent: t.agent, worktree: t.worktree, workspace },
         undefined // batch-level cancellation is handled via oc_cancel per job
       ).then((r) => ({
@@ -309,7 +330,7 @@ async function handleDelegateBatch(args, requestId) {
 }
 
 async function handleStatus(args) {
-  const workspace = resolveWorkspaceArg(args);
+  const workspace = await resolveWorkspaceArg(args);
   let jobs = loadState(workspace).jobs ?? [];
   jobs = await recoverStrandedResults(workspace, jobs, defaultServerUrl());
   jobs = reconcileStrandedJobs(workspace, jobs);
@@ -318,7 +339,7 @@ async function handleStatus(args) {
 }
 
 async function handleResult(args) {
-  const workspace = resolveWorkspaceArg(args);
+  const workspace = await resolveWorkspaceArg(args);
   const ref = typeof args.job === "string" && args.job.trim() ? args.job.trim() : undefined;
   if (ref && !/^[A-Za-z0-9._:-]+$/.test(ref)) {
     return errText("Error: invalid job reference. Use a job id or safe id prefix.");
@@ -341,7 +362,7 @@ async function handleResult(args) {
 }
 
 async function handleCancel(args) {
-  const workspace = resolveWorkspaceArg(args);
+  const workspace = await resolveWorkspaceArg(args);
   const ref = typeof args.job === "string" && args.job.trim() ? args.job.trim() : undefined;
   if (ref && !/^[A-Za-z0-9._:-]+$/.test(ref)) {
     return errText("Error: invalid job reference.");
@@ -506,4 +527,16 @@ function main() {
   rl.on("close", () => process.exit(0));
 }
 
-main();
+// Only start the stdio JSON-RPC loop when run as the entry script. Guarding this
+// lets tests import the handlers (and their injectable seams) without spawning
+// the server on stdin. realpath both sides so a symlinked launch still matches.
+function isEntryPoint() {
+  try {
+    return !!process.argv[1] &&
+      realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) main();
