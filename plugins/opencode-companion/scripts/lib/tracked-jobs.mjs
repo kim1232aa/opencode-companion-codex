@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, appendLine, pidStartTime } from "./fs.mjs";
-import { generateJobId, upsertJob, jobLogPath, jobDataPath } from "./state.mjs";
+import { generateJobId, upsertJob, updateState, jobLogPath, jobDataPath } from "./state.mjs";
 
 const SESSION_ID_ENV = "OPENCODE_COMPANION_SESSION_ID";
 
@@ -72,12 +72,19 @@ export async function runTrackedJob(workspacePath, job, runner) {
     report("starting", `Job ${job.id} started`);
     const result = await runner({ report, log });
 
-    // Mark as completed
-    upsertJob(workspacePath, {
-      id: job.id,
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      result: result?.rendered ?? result?.summary ?? null,
+    // Mark as completed — CAS: an aborted OpenCode session RETURNS normally
+    // with partial output instead of throwing, so a cancel that landed during
+    // the run must not be overwritten by a bogus "completed".
+    let finalized = false;
+    updateState(workspacePath, (state) => {
+      const j = state.jobs?.find((x) => x.id === job.id);
+      if (!j) return;
+      if (j.status !== "running" && j.status !== "pending") return; // e.g. canceled
+      j.status = "completed";
+      j.completedAt = new Date().toISOString();
+      j.result = result?.rendered ?? result?.summary ?? null;
+      j.updatedAt = new Date().toISOString();
+      finalized = true;
     });
 
     // Write result data file
@@ -85,16 +92,24 @@ export async function runTrackedJob(workspacePath, job, runner) {
     ensureDir(path.dirname(dataFile));
     fs.writeFileSync(dataFile, JSON.stringify(result, null, 2), { encoding: "utf8", mode: 0o600 });
 
-    report("completed", `Job ${job.id} completed`);
+    if (finalized) report("completed", `Job ${job.id} completed`);
     return result;
   } catch (err) {
-    upsertJob(workspacePath, {
-      id: job.id,
-      status: "failed",
-      completedAt: new Date().toISOString(),
-      errorMessage: err.message,
+    // CAS: don't clobber a status someone else already finalized — e.g. cancel
+    // wrote "canceled" and THEN aborted our session, which is what made this
+    // very code path throw. Overwriting would flip a user's cancel to "failed".
+    let wrote = false;
+    updateState(workspacePath, (state) => {
+      const j = state.jobs?.find((x) => x.id === job.id);
+      if (!j) return;
+      if (j.status !== "running" && j.status !== "pending") return; // already terminal
+      j.status = "failed";
+      j.completedAt = new Date().toISOString();
+      j.errorMessage = err.message;
+      j.updatedAt = new Date().toISOString();
+      wrote = true;
     });
-    report("failed", `Job ${job.id} failed: ${err.message}`);
+    if (wrote) report("failed", `Job ${job.id} failed: ${err.message}`);
     throw err;
   }
 }
