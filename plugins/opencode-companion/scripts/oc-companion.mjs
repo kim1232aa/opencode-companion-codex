@@ -229,8 +229,13 @@ async function handleDelegate(args, requestId) {
         // (tokens climbing) from "stuck" (frozen) during a long blocking run.
         const heartbeat = setInterval(async () => {
           const u = await client.getSessionUsage(sessionId, { timeoutMs: 8_000 }).catch(() => null);
-          if (u && u.total > 0) {
-            log(`heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`);
+          // Log EVERY beat (even at 0 tokens) so the job log's freshness tracks
+          // worker liveness: fresh + 0 tokens = connected but the model hasn't
+          // emitted yet (a hung/silent turn); STALE = the worker itself is gone.
+          if (u) {
+            log(u.total > 0
+              ? `heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`
+              : `heartbeat: connected, 0 tokens yet (model has not emitted)`);
           }
         }, 30_000);
         heartbeat.unref?.();
