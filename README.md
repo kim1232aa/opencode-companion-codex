@@ -15,15 +15,18 @@ Codex ──(MCP, blocking)──▶ opencode-companion ──(REST)──▶ op
 
 ## What you get
 
-Five MCP tools, each with a matching skill that teaches Codex when and how to
+Nine MCP tools, each with a matching skill that teaches Codex when and how to
 use them:
 
 | Tool | What it does |
 |---|---|
-| `oc_delegate` | Delegate a task and **block until the real result returns** — one MCP call, no polling, up to 7 days. Returns the output, a token-usage line, changed files, and a resumable session id. |
-| `oc_status` | Running/recent jobs with a **live token-progress heartbeat** (`heartbeat: N tokens so far` every 30 s) — tokens climbing means generating, frozen means stuck. |
+| `oc_delegate` | Delegate a task and **block until the real result returns** — one MCP call, no polling, up to 7 days. Returns the output, a **one-line token/model/session trailer**, and changed files. |
+| `oc_delegate_batch` | Delegate **several independent tasks in parallel** in one call — the host runs MCP tools serially, so batching is the only way to fan out (e.g. to different models). Blocks until all finish, returns every result. |
+| `oc_status` | Running/recent jobs with a **live token heartbeat** and the **actual commands OpenCode is running** (`bash:`/`edit:`/`read:` activity lines) — tokens climbing means generating, frozen means stuck. |
 | `oc_result` | Fetch a finished job's output — including **recovering the answer of an interrupted run** from the OpenCode server (marked `recovered`). |
-| `oc_cancel` | Abort a running job's OpenCode session (never clobbers an already-finished result). |
+| `oc_cancel` | Abort a running job's OpenCode session (never clobbers an already-finished result). Called with **no job ref, it cancels every running job** in the workspace. |
+| `oc_review` / `oc_adversarial_review` | **Read-only code review** of the working-tree diff (or a `base` branch diff) on OpenCode, returning structured findings against the review-output schema. The adversarial variant takes a `focus` and tries to break the change rather than validate it. |
+| `oc_resume_candidate` | Find the most recent **resumable** task session for the workspace, so you can continue it via `oc_delegate`'s `resumeSession`. |
 | `oc_setup` | Check the OpenCode install, server, and configured providers. |
 
 The delegation core is shared with
@@ -101,7 +104,7 @@ the shared engine code.
 ## Development
 
 ```bash
-npm test          # 64 tests: lib + full MCP protocol handshake
+npm test          # lib + full MCP protocol handshake + review/trailer/cancel-all
 ```
 
 For local iteration, install from a checkout:

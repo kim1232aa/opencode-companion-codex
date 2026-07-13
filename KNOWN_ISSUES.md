@@ -21,3 +21,14 @@
 - **Plugin updates need a new Codex session.** After `codex plugin add`
   reinstalls a newer version, running conversations keep the old tools; start
   a fresh session to pick up changes.
+- **No automatic review gate.** The Claude Code frontend can run an optional
+  Stop-time OpenCode review that blocks the turn when issues are found; Codex
+  has no hook system, so there is no equivalent. Invoke `oc_review` /
+  `oc_adversarial_review` explicitly instead.
+- **Canceling a `oc_delegate_batch` call does not cascade to its sub-jobs.**
+  The batch's parallel sub-delegations are not individually registered for
+  MCP `notifications/cancelled`, so aborting the batch tool call itself leaves
+  its OpenCode sessions running. Stop them with `oc_cancel` — per job id, or
+  with no argument to cancel every running job in the workspace. (An explicit
+  `oc_cancel` does stop a batch sub-job: it marks the job canceled, which the
+  in-flight dispatch observes and does not retry.)
