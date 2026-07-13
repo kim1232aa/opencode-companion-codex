@@ -1,39 +1,111 @@
 // Output rendering for the OpenCode companion.
+
+// A run can finish with status "completed" yet produce NO usable text (a model
+// that returns an empty turn — observed with some combo-router models). That is
+// NOT a success; surface it explicitly so status/result judgment isn't fooled.
+export const EMPTY_RESULT_WARNING =
+  "### ⚠️ No output\n\nThe run finished but the model produced NO usable output " +
+  "(an empty response). This is NOT a successful result — the model may be " +
+  "misconfigured or unsuitable for this task. Try a different --model or rephrase the task.";
+
+/**
+ * True when a job finished successfully-shaped but its result text is blank.
+ * @param {object} [resultData]
+ * @returns {boolean}
+ */
+export function isEmptyResult(resultData) {
+  if (!resultData) return true;
+  if (typeof resultData.rendered === "string" && resultData.rendered.trim()) return false;
+  if (typeof resultData.summary === "string" && resultData.summary.trim()) return false;
+  if (Array.isArray(resultData.messages)) {
+    const last = resultData.messages.filter((m) => m.role === "assistant").pop();
+    if (last && extractMessageText(last).trim()) return false;
+  }
+  return true;
+}
 /**
  * Render a status snapshot as human-readable text.
  * @param {{ running: object[], latestFinished: object|null, recent: object[] }} snapshot
  * @returns {string}
  */
+// Pull the live signal out of a running job's log tail: the newest heartbeat
+// token count and how long ago the newest log line was written (staleness).
+// Lets a caller tell "generating" (tokens up / fresh) from "stuck" (stale) from
+// "done/errored" — the exact judgment that a bare "running" label can't give.
+function liveSignal(progressPreview) {
+  if (typeof progressPreview !== "string" || !progressPreview) return {};
+  const lines = progressPreview.split("\n").filter(Boolean);
+  let tokens = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/heartbeat:\s*([\d,]+)\s*tokens/i);
+    if (m) { tokens = m[1]; break; }
+  }
+  let ageSec = null;
+  const lastTs = lines[lines.length - 1]?.match(/^\[([^\]]+)\]/)?.[1];
+  const t = lastTs ? Date.parse(lastTs) : NaN;
+  if (Number.isFinite(t)) ageSec = Math.max(0, Math.round((Date.now() - t) / 1000));
+  return { tokens, ageSec };
+}
+
+const STATUS_ICON = {
+  running: "🟢", pending: "🟡", completed: "✅", failed: "❌", canceled: "⛔",
+};
+
+function statusLine(j) {
+  const icon = STATUS_ICON[j.status] ?? "•";
+  const empty = j.emptyResult && (j.status === "completed") ? " ⚠️ no output" : "";
+  return `- ${icon} **${j.id}** (${j.type}) — ${j.status}${empty} — ${j.elapsed ?? "just started"}`;
+}
+
 export function renderStatus(snapshot) {
   const lines = [];
   const running = Array.isArray(snapshot.running) ? snapshot.running : [];
   const recent = Array.isArray(snapshot.recent) ? snapshot.recent : [];
+
   if (running.length > 0) {
-    lines.push("## Running Jobs\n");
+    lines.push(`## Running Jobs (${running.length})\n`);
     for (const job of running) {
-      lines.push(`- **${job.id}** (${job.type}) — ${job.phase ?? "running"} — ${job.elapsed ?? "just started"}`);
+      const { tokens, ageSec } = liveSignal(job.progressPreview);
+      const bits = [`${STATUS_ICON[job.status] ?? "🟢"} **${job.id}** (${job.type})`, job.phase ?? "running", job.elapsed ?? "just started"];
+      if (tokens) bits.push(`${tokens} tokens`);
+      if (ageSec != null) bits.push(`updated ${ageSec}s ago${ageSec > 120 ? " ⚠️ possibly stuck" : ""}`);
+      lines.push(`- ${bits.join(" · ")}`);
       if (job.progressPreview) {
         lines.push(`  > ${job.progressPreview.split("\n").join("\n  > ")}`);
       }
     }
     lines.push("");
+    lines.push("_Tokens rising between two checks = generating. Same tokens + a large \"updated … ago\" = stuck. Failed/❌ or ⚠️ no-output = did not succeed._");
+    lines.push("");
   }
-  if (snapshot.latestFinished) {
+
+  // Any FAILED job among the recent set gets surfaced up front — a mid-run
+  // error otherwise hides at the bottom while you watch the runners.
+  const failed = recent.filter((j) => j.status === "failed");
+  if (failed.length > 0) {
+    lines.push(`## ❌ Failed (${failed.length})\n`);
+    for (const j of failed) {
+      lines.push(statusLine(j));
+      if (j.errorMessage) lines.push(`  Error: ${j.errorMessage}`);
+    }
+    lines.push("");
+  }
+
+  if (snapshot.latestFinished && snapshot.latestFinished.status !== "failed") {
     lines.push("## Latest Finished\n");
     const j = snapshot.latestFinished;
-    lines.push(`- **${j.id}** (${j.type}) — ${j.status} — ${j.elapsed}`);
-    if (j.errorMessage) {
-      lines.push(`  Error: ${j.errorMessage}`);
-    }
+    lines.push(statusLine(j));
+    if (j.errorMessage) lines.push(`  Error: ${j.errorMessage}`);
     lines.push("");
   }
-  if (recent.length > 1) {
+
+  const otherRecent = recent.slice(1).filter((j) => j.status !== "failed");
+  if (otherRecent.length > 0) {
     lines.push("## Recent Jobs\n");
-    for (const j of recent.slice(1)) {
-      lines.push(`- **${j.id}** (${j.type}) — ${j.status} — ${j.elapsed}`);
-    }
+    for (const j of otherRecent) lines.push(statusLine(j));
     lines.push("");
   }
+
   if (lines.length === 0) {
     lines.push("No OpenCode jobs found for this workspace.");
   }
@@ -61,20 +133,21 @@ export function renderResult(job, resultData) {
   if (job.status === "failed") {
     lines.push(`### Error\n\n${job.errorMessage || `Unknown error (job ${job.id})`}`);
   } else if (resultData) {
-    if (resultData.rendered) {
-      lines.push(`### Output\n\n${resultData.rendered}`);
+    const rendered = typeof resultData.rendered === "string" ? resultData.rendered : "";
+    if (rendered.trim()) {
+      lines.push(`### Output\n\n${rendered}`);
     } else if (Array.isArray(resultData.messages)) {
       // Extract the last assistant message
       const assistantMsgs = resultData.messages.filter((m) => m.role === "assistant");
       const last = assistantMsgs[assistantMsgs.length - 1];
-      if (last) {
-        const text = extractMessageText(last);
-        lines.push(`### Output\n\n${text}`);
-      }
-    } else if (resultData.summary) {
+      const text = last ? extractMessageText(last) : "";
+      lines.push(text.trim() ? `### Output\n\n${text}` : EMPTY_RESULT_WARNING);
+    } else if (typeof resultData.summary === "string" && resultData.summary.trim()) {
       lines.push(`### Summary\n\n${resultData.summary}`);
     } else {
-      lines.push("### Output\n\n(No output captured)");
+      // "completed" but the model produced nothing usable — NOT a success. Say
+      // so loudly so neither a human nor a delegating agent mistakes it.
+      lines.push(EMPTY_RESULT_WARNING);
     }
     if (resultData.changedFiles?.length > 0) {
       lines.push(`\n### Changed Files\n`);
@@ -82,7 +155,7 @@ export function renderResult(job, resultData) {
         lines.push(`- ${f}`);
       }
     }
-    const usageLine = formatUsage(resultData.usage);
+    const usageLine = formatUsage(resultData.usage, { requestedModel: resultData.requestedModel });
     if (usageLine) {
       lines.push(`\n### Token Usage\n`);
       lines.push(usageLine);

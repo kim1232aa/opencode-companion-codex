@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, appendLine, pidStartTime } from "./fs.mjs";
 import { generateJobId, upsertJob, updateState, jobLogPath, jobDataPath } from "./state.mjs";
+import { isEmptyResult } from "./render.mjs";
 
 const SESSION_ID_ENV = "OPENCODE_COMPANION_SESSION_ID";
 
@@ -83,6 +84,7 @@ export async function runTrackedJob(workspacePath, job, runner) {
       j.status = "completed";
       j.completedAt = new Date().toISOString();
       j.result = result?.rendered ?? result?.summary ?? null;
+      j.emptyResult = isEmptyResult(result);
       j.updatedAt = new Date().toISOString();
       finalized = true;
     });

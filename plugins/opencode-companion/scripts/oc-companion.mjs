@@ -261,7 +261,13 @@ async function handleDelegate(args, requestId) {
       })
     );
 
-    const lines = [result.rendered];
+    // A run can finish with no usable text (some models return an empty turn) —
+    // say so loudly instead of returning a blank success, so the caller doesn't
+    // mistake "completed" for "succeeded".
+    const producedText = typeof result.rendered === "string" && result.rendered.trim();
+    const lines = [producedText
+      ? result.rendered
+      : "⚠️ The delegated run COMPLETED but the model produced NO usable output (empty response). This is NOT a successful result — try a different model or rephrase the task."];
     const usageLine = formatUsage(result.usage, { requestedModel: result.requestedModel });
     if (usageLine) lines.push(`\n---\n${usageLine}`);
     if (result.changedFiles?.length) {

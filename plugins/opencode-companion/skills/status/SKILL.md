@@ -5,12 +5,20 @@ description: Show running and recent OpenCode delegation jobs, including a live 
 
 # OpenCode Job Status
 
-Call the `oc_status` MCP tool and return its output.
+Call the `oc_status` MCP tool and return its output. It is a multi-job
+dashboard — read every section, not just the first.
 
-- Running jobs show a `heartbeat: N tokens so far` line refreshed every ~30s.
-  **Tokens climbing between two calls = the model is generating; frozen across
-  several = genuinely stuck.** A quiet log is otherwise normal — it only
-  changes on phase transitions.
+Judge each job's state from the dashboard, not from token motion alone:
+- 🟢 **running** shows a live token count and `updated Ns ago`. **Tokens higher
+  than the previous check = generating.** Same tokens with a large "updated …
+  ago" (the tool flags `⚠️ possibly stuck` past ~2 min) = stuck, not done.
+- ❌ **Failed** jobs are surfaced at the TOP with their error — a mid-run error
+  no longer hides at the bottom while you watch the runners.
+- ✅ **completed** = finished with output. **`⚠️ no output` = finished but the
+  model returned nothing usable — that is NOT success.** Treat it like a
+  failure: try a different `model` or rephrase.
+- Token motion tells you "alive", not "succeeded" — always confirm the final
+  state and that output exists.
 - Do NOT call this in a loop while an `oc_delegate` call is pending in this
   conversation — that call already blocks until completion. Status is for
   checking on interrupted or background work, or when the user asks.
