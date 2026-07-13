@@ -76,12 +76,22 @@ describe("oc-companion MCP server", () => {
     srv.notify("notifications/initialized", {});
   });
 
-  it("lists the five tools with schemas", async () => {
+  it("lists the six tools with schemas", async () => {
     const res = await srv.call("tools/list", {});
     const names = res.result.tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ["oc_cancel", "oc_delegate", "oc_result", "oc_setup", "oc_status"]);
+    assert.deepEqual(names, ["oc_cancel", "oc_delegate", "oc_delegate_batch", "oc_result", "oc_setup", "oc_status"]);
     const delegate = res.result.tools.find((t) => t.name === "oc_delegate");
     assert.deepEqual(delegate.inputSchema.required, ["task"]);
+    const batch = res.result.tools.find((t) => t.name === "oc_delegate_batch");
+    assert.deepEqual(batch.inputSchema.required, ["tasks"]);
+  });
+
+  it("oc_delegate_batch validates its tasks array", async () => {
+    const empty = await srv.call("tools/call", { name: "oc_delegate_batch", arguments: { tasks: [] } });
+    assert.equal(empty.result.isError, true);
+    const badItem = await srv.call("tools/call", { name: "oc_delegate_batch", arguments: { tasks: [{ label: "x" }] } });
+    assert.equal(badItem.result.isError, true);
+    assert.match(badItem.result.content[0].text, /tasks\[0\]\.task/);
   });
 
   it("rejects an unknown tool with -32601", async () => {

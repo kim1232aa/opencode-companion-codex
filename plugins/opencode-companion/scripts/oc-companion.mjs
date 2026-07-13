@@ -92,6 +92,34 @@ const TOOLS = [
     },
   },
   {
+    name: "oc_delegate_batch",
+    description:
+      "Delegate SEVERAL independent coding tasks to OpenCode IN PARALLEL with a single call, blocking until ALL finish, and return every result. Use this instead of multiple oc_delegate calls whenever you have 2+ independent tasks (e.g. fanning out to different models or reviewing different modules) — the host executes MCP tools sequentially, so batching is the only way to get true parallelism. Same no-polling rule as oc_delegate.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tasks: {
+          type: "array",
+          minItems: 1,
+          description: "Independent tasks to run concurrently. Each runs in its own OpenCode session.",
+          items: {
+            type: "object",
+            properties: {
+              task: { type: "string", description: "Full, self-contained task text (forwarded verbatim)." },
+              model: { type: "string", description: "Optional provider/model ref for THIS task." },
+              agent: { type: "string", enum: ["build", "plan"], description: "'build' (default, write) or 'plan' (read-only)." },
+              worktree: { type: "boolean", description: "Isolate this write task in a throwaway git worktree. Strongly recommended when several write tasks in the batch touch the same repository." },
+              label: { type: "string", description: "Optional short label echoed back with this task's result." },
+            },
+            required: ["task"],
+          },
+        },
+        workspace: { type: "string", description: "Workspace path for all tasks. Defaults to the server's cwd." },
+      },
+      required: ["tasks"],
+    },
+  },
+  {
     name: "oc_status",
     description:
       "Show running and recent OpenCode jobs for a workspace. Running jobs display a live 'heartbeat: N tokens so far' line — tokens climbing across two calls means the model is generating; frozen means it is stuck. Also salvages results of jobs whose worker died.",
@@ -223,6 +251,47 @@ async function handleDelegate(args, requestId) {
   }
 }
 
+async function handleDelegateBatch(args, requestId) {
+  const tasks = Array.isArray(args.tasks) ? args.tasks : null;
+  if (!tasks || tasks.length === 0) {
+    return errText("Error: tasks must be a non-empty array of { task, model?, agent?, worktree?, label? }.");
+  }
+  for (const [i, t] of tasks.entries()) {
+    if (!t || typeof t.task !== "string" || !t.task.trim()) {
+      return errText(`Error: tasks[${i}].task is required and must be a non-empty string.`);
+    }
+  }
+  const workspace = typeof args.workspace === "string" ? args.workspace : undefined;
+
+  // Run every task concurrently, each as its own tracked job + OpenCode
+  // session. handleDelegate never rejects (errors come back as errText), so
+  // one failed task cannot take down its siblings.
+  const results = await Promise.all(
+    tasks.map((t, i) =>
+      handleDelegate(
+        { task: t.task, model: t.model, agent: t.agent, worktree: t.worktree, workspace },
+        undefined // batch-level cancellation is handled via oc_cancel per job
+      ).then((r) => ({
+        label: typeof t.label === "string" && t.label.trim() ? t.label.trim() : `task ${i + 1}`,
+        isError: r.isError === true,
+        text: r.content?.[0]?.text ?? "",
+      }))
+    )
+  );
+
+  const okCount = results.filter((r) => !r.isError).length;
+  const sections = results.map((r) =>
+    `### ${r.label}${r.isError ? " — FAILED" : ""}\n\n${r.text}`
+  );
+  const out = [
+    `Batch finished: ${okCount}/${results.length} succeeded.`,
+    "",
+    sections.join("\n\n---\n\n"),
+  ].join("\n");
+  // Surface isError only when EVERY task failed; partial results are results.
+  return okCount === 0 ? errText(out) : text(out);
+}
+
 async function handleStatus(args) {
   const workspace = resolveWorkspaceArg(args);
   let jobs = loadState(workspace).jobs ?? [];
@@ -315,6 +384,7 @@ async function handleSetup() {
 
 const HANDLERS = {
   oc_delegate: handleDelegate,
+  oc_delegate_batch: handleDelegateBatch,
   oc_status: handleStatus,
   oc_result: handleResult,
   oc_cancel: handleCancel,

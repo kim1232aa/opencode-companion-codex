@@ -8,6 +8,14 @@ description: Delegate a coding task from Codex to OpenCode running on a cheap Op
 Call the `oc_delegate` MCP tool with the task text. The call BLOCKS until the
 OpenCode run finishes and returns the full result plus a token-usage line.
 
+**Two or more independent tasks? Use `oc_delegate_batch` in ONE call** — the
+host runs MCP tools sequentially, so issuing several `oc_delegate` calls
+executes them one-by-one; `oc_delegate_batch` runs the whole array in parallel
+server-side and returns every result (each with its own token line and
+resumable session). Give each entry a short `label`. For multiple WRITE tasks
+touching the same repository, set `worktree: true` on each so they can't
+trample each other.
+
 ## Rules
 
 - **One call is the whole delegation.** While `oc_delegate` is pending, do not
