@@ -1,0 +1,29 @@
+opencode-companion-codex
+Copyright 2026 kim1232aa and contributors
+
+This is the Codex CLI frontend of the OpenCode delegation engine developed in
+kim1232aa/opencode-companion-cc. The Codex-specific parts — the MCP (stdio)
+server, the tool surface, and the skills — are original to this project.
+
+The shared engine code under plugins/opencode-companion/scripts/lib/ descends
+from the following lineage (Apache License 2.0):
+
+  - codex-plugin-cc (https://github.com/openai/codex-plugin-cc) by OpenAI
+    — the original companion-plugin architecture and state-tracking pattern.
+
+  - opencode-plugin-cc (https://github.com/tasict/opencode-plugin-cc) by tasict
+    — the OpenCode adaptation of that architecture.
+
+  - opencode-companion-cc (https://github.com/kim1232aa/opencode-companion-cc)
+    — the hardened fork this repo's lib/ is taken from, including fixes
+    harvested from the suharvest and JohnnyVicious forks (see that repo's
+    NOTICE for the full modification history through v2.0.5).
+
+Modifications made in this repository (per Apache License 2.0, Section 4(b)):
+a newline-delimited JSON-RPC MCP server frontend replacing the Claude Code
+slash-command/agent frontend; in-process delegation with MCP cancellation
+mapped to OpenCode session aborts; task text carried in structured MCP params
+instead of argv; a Codex-appropriate stable state directory
+(~/.opencode-companion-codex); and host-neutral safety-header wording.
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.

@@ -1,0 +1,33 @@
+{
+  "name": "opencode-companion",
+  "version": "0.1.0",
+  "description": "Delegate coding tasks from Codex to OpenCode on any OpenAI-compatible backend, with blocking results, token usage, and crash-safe result recovery.",
+  "author": {
+    "name": "kim1232aa"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "opencode",
+    "delegate",
+    "openai-compatible",
+    "review",
+    "token-saving"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "OpenCode",
+    "shortDescription": "Delegate coding tasks to OpenCode and cheap OpenAI-compatible models",
+    "longDescription": "Use OpenCode as a coding companion from within Codex. Delegate implementation or investigation tasks to any OpenAI-compatible backend (a local aggregator, DeepSeek, GLM, Kimi, Doubao, ...), block until the real result returns with a token-usage line, watch live token-progress heartbeats, and recover finished answers even if a run is interrupted.",
+    "developerName": "kim1232aa",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Delegate a coding task to OpenCode",
+      "Check my OpenCode delegation status"
+    ]
+  }
+}

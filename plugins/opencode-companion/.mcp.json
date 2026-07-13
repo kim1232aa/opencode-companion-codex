@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "opencode-companion": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "./scripts/oc-companion.mjs"
+      ],
+      "cwd": ".",
+      "tool_timeout_sec": 604800,
+      "default_tools_approval_mode": "approve"
+    }
+  }
+}
