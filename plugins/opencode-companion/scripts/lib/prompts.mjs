@@ -22,10 +22,16 @@ export async function buildReviewPrompt(cwd, opts, pluginRoot) {
   let systemPrompt;
   if (opts.adversarial) {
     const templatePath = path.join(pluginRoot, "prompts", "adversarial-review.md");
+    const fills = {
+      "{{TARGET_LABEL}}": opts.base ? `Branch diff against ${opts.base}` : "Working tree changes",
+      "{{USER_FOCUS}}": opts.focus || "General review",
+      "{{REVIEW_INPUT}}": buildReviewContext(diff, status, changedFiles),
+    };
+    // One pass over the template so a placeholder that appears INSIDE an injected
+    // value (a user focus, or a diff that literally contains "{{REVIEW_INPUT}}")
+    // is never itself expanded.
     systemPrompt = fs.readFileSync(templatePath, "utf8")
-      .replace("{{TARGET_LABEL}}", () => (opts.base ? `Branch diff against ${opts.base}` : "Working tree changes"))
-      .replace("{{USER_FOCUS}}", () => opts.focus || "General review")
-      .replace("{{REVIEW_INPUT}}", () => buildReviewContext(diff, status, changedFiles));
+      .replace(/\{\{(?:TARGET_LABEL|USER_FOCUS|REVIEW_INPUT)\}\}/g, (m) => fills[m]);
   } else {
     systemPrompt = buildStandardReviewPrompt(diff, status, changedFiles, opts);
   }

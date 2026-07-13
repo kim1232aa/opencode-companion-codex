@@ -30,7 +30,7 @@ import {
   recoverStrandedResults,
   isOwnedProcessAlive,
 } from "./lib/job-control.mjs";
-import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
+import { createJobRecord, runTrackedJob, getClaudeSessionId, isJobCanceled } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, formatUsage, formatTrailer } from "./lib/render.mjs";
 import { buildTaskPrompt, buildReviewPrompt } from "./lib/prompts.mjs";
 import { assertSafeRef } from "./lib/git.mjs";
@@ -187,11 +187,11 @@ const TOOLS = [
   },
   {
     name: "oc_cancel",
-    description: "Cancel a running OpenCode job: aborts its OpenCode session and marks the job canceled (never clobbers an already-finished result). Omit 'job' to cancel ALL running/pending jobs in the current session.",
+    description: "Cancel a running OpenCode job: aborts its OpenCode session and marks the job canceled (never clobbers an already-finished result). Omit 'job' to cancel every running/pending job in this workspace.",
     inputSchema: {
       type: "object",
       properties: {
-        job: { type: "string", description: "Job id or unique prefix. Omit to cancel every running/pending job in the current session." },
+        job: { type: "string", description: "Job id or unique prefix. Omit to cancel every running/pending job in this workspace." },
         workspace: { type: "string", description: "Workspace path. Defaults to the server's cwd." },
       },
     },
@@ -309,6 +309,7 @@ async function handleDelegate(args, requestId) {
             upsertJob(workspace, { id: job.id, opencodeSessionId: sid });
             if (requestId !== undefined) inflight.set(requestId, { sessionId: sid, jobId: job.id, workspace });
           },
+          shouldStop: () => isJobCanceled(workspace, job.id),
         });
         const response = dispatch.response;
         const sessionId = dispatch.sessionId;
@@ -450,9 +451,12 @@ export async function handleCancel(args) {
   }
   const jobs = reconcileStrandedJobs(workspace, loadState(workspace).jobs ?? []);
 
-  // No ref ⇒ cancel EVERY running/pending job for THIS Claude session
-  // (cancel-all), strictly session-scoped so another session's jobs are never
-  // touched. A ref still targets exactly that one job.
+  // No ref ⇒ cancel EVERY running/pending job in this workspace (cancel-all).
+  // resolveCancelableJobs scopes to a session id when one is set, but Codex
+  // exposes no ambient session id (getClaudeSessionId is empty unless
+  // OPENCODE_COMPANION_SESSION_ID is exported), so in practice this cancels the
+  // workspace's running jobs regardless of which Codex conversation started
+  // them. A ref still targets exactly that one job.
   const { jobs: targets, ambiguous } = resolveCancelableJobs(jobs, ref, { sessionId: getClaudeSessionId() });
   if (ambiguous) return errText("Error: multiple running jobs — give a job id prefix.");
   if (!targets.length) return text("No active job to cancel.");
@@ -578,6 +582,7 @@ async function runReview(args, requestId, { adversarial }) {
           upsertJob(workspace, { id: job.id, opencodeSessionId: sid });
           if (requestId !== undefined) inflight.set(requestId, { sessionId: sid, jobId: job.id, workspace });
         },
+        shouldStop: () => isJobCanceled(workspace, job.id),
       });
       const response = dispatch.response;
       const sessionId = dispatch.sessionId;
@@ -730,6 +735,18 @@ async function handleMessage(msg) {
     const entry = inflight.get(reqId);
     if (entry) {
       inflight.delete(reqId);
+      // Mark the job canceled BEFORE aborting so an in-flight dispatch that is
+      // mid-retry sees the cancel via its shouldStop check and does not re-run
+      // the task on a fresh session. CAS-style: never clobber a terminal status.
+      updateState(entry.workspace, (state) => {
+        const j = state.jobs?.find((x) => x.id === entry.jobId);
+        if (j && (j.status === "running" || j.status === "pending")) {
+          j.status = "canceled";
+          j.completedAt = new Date().toISOString();
+          j.errorMessage = "Canceled by user";
+          j.updatedAt = new Date().toISOString();
+        }
+      });
       try {
         const client = createClient(defaultServerUrl(), { directory: entry.workspace });
         await client.abortSession(entry.sessionId);

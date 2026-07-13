@@ -128,4 +128,34 @@ describe("dispatchWithRetry", () => {
     assert.equal(calls.sendPrompt, 3);
     assert.ok(calls.abortSession >= 3);
   });
+
+  it("does NOT retry once shouldStop reports the job canceled (external cancel)", async () => {
+    // A cancel arrives mid-attempt: sendPrompt throws (an aborted stream looks
+    // like a transient fault), but shouldStop now reads canceled state, so the
+    // task must NOT be re-run on a fresh session.
+    let canceled = false;
+    const client = makeClient({ sendPrompt: () => { canceled = true; throw new Error("aborted"); } });
+    await assert.rejects(
+      dispatchWithRetry(opts(client, { shouldStop: () => canceled })),
+      (err) => /Delegation canceled/.test(err.message),
+    );
+    assert.equal(client.calls.sendPrompt, 1, "the write task ran once, not re-run after cancel");
+  });
+
+  it("bails before the first attempt when already canceled", async () => {
+    const client = makeClient({ sendPrompt: () => ({ text: "should never run" }) });
+    await assert.rejects(
+      dispatchWithRetry(opts(client, { shouldStop: () => true })),
+      (err) => /Delegation canceled/.test(err.message),
+    );
+    assert.equal(client.calls.sendPrompt, 0, "never dispatched a canceled job");
+  });
+
+  it("completes normally when shouldStop stays false", async () => {
+    const client = makeClient({ sendPrompt: () => ({ text: "ok" }) });
+    const res = await dispatchWithRetry(opts(client, { shouldStop: () => false }));
+    assert.equal(res.attempts, 1);
+    assert.equal(extract(res.response), "ok");
+    assert.equal(client.calls.sendPrompt, 1);
+  });
 });

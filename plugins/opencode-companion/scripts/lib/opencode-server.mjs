@@ -705,10 +705,13 @@ export function extractActivityLines(messages, opts = {}) {
     for (const p of parts) {
       if (!p || p.type !== "tool") continue;
       const id = p.id ?? p.callID ?? p.callId ?? null;
-      if (seen && id != null && seen.has(id)) continue;
       const line = formatToolActivity(p, { maxLen: opts.maxLen });
       if (!line) continue; // pending / no-input ⇒ leave un-seen for a later poll
-      if (seen && id != null) seen.add(id);
+      // Dedupe by part id when present; fall back to the rendered line so an
+      // id-less tool part isn't re-emitted on every beat.
+      const key = id != null ? id : line;
+      if (seen && seen.has(key)) continue;
+      if (seen) seen.add(key);
       out.push(line);
     }
   }
@@ -743,12 +746,19 @@ const _delay = (ms) => new Promise((r) => setTimeout(r, ms));
 export async function dispatchWithRetry(opts) {
   const {
     client, prompt, agent, model, extract, log,
-    makeSession, resumeSessionId, onSession,
+    makeSession, resumeSessionId, onSession, shouldStop,
     maxAttempts = 3, stallMs = 120_000, beatMs = 30_000, backoffMs = 1500,
   } = opts;
   const stallReason = `no token progress for ${Math.round(stallMs / 1000)}s (stalled)`;
   let lastErr = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // External cancel (oc_cancel / notifications/cancelled marks the job canceled
+    // in shared state) must not be retried: an aborted sendPrompt can surface as
+    // a transient throw, which would otherwise re-run a write task on a fresh
+    // session. Bail before starting — or re-starting after backoff — an attempt.
+    if (typeof shouldStop === "function" && (await shouldStop())) {
+      throw new Error("Delegation canceled.");
+    }
     const retrying = attempt < maxAttempts;
     let sessionId;
     if (attempt === 1 && resumeSessionId) sessionId = resumeSessionId;

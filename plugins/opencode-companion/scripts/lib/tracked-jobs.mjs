@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, appendLine, pidStartTime } from "./fs.mjs";
-import { generateJobId, upsertJob, updateState, jobLogPath, jobDataPath } from "./state.mjs";
+import { generateJobId, upsertJob, updateState, loadState, jobLogPath, jobDataPath } from "./state.mjs";
 import { isEmptyResult } from "./render.mjs";
 
 const SESSION_ID_ENV = "OPENCODE_COMPANION_SESSION_ID";
@@ -17,6 +17,24 @@ export function getClaudeSessionId() {
   // non-existent CLAUDE_SESSION_ID); the OPENCODE_COMPANION_SESSION_ID override
   // still wins when present.
   return process.env[SESSION_ID_ENV] || process.env.CLAUDE_CODE_SESSION_ID;
+}
+
+/**
+ * Whether a job has been marked canceled in shared state. Used as the
+ * dispatchWithRetry `shouldStop` signal so an external cancel — a separate
+ * `cancel`/`oc_cancel` process, or an MCP `notifications/cancelled` — aborts the
+ * run instead of being mistaken for a transient fault and retried on a fresh
+ * session (which would re-run a write task).
+ * @param {string} workspacePath
+ * @param {string} jobId
+ * @returns {boolean}
+ */
+export function isJobCanceled(workspacePath, jobId) {
+  try {
+    return (loadState(workspacePath).jobs ?? []).find((j) => j.id === jobId)?.status === "canceled";
+  } catch {
+    return false;
+  }
 }
 
 /**
