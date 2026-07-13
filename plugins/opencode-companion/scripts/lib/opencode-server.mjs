@@ -526,6 +526,26 @@ export function createClient(baseUrl, opts = {}) {
     // Providers
     listProviders: () => request("GET", "/provider"),
 
+    /**
+     * All valid model refs the server knows, as a Set of "<providerID>/<modelID>"
+     * strings. providerID is the OpenCode provider (e.g. "volcano-coding"); the
+     * modelID may itself contain slashes (e.g. "火山方舟Coding_Plan/glm-5.2"), so a
+     * full ref can have several slashes. Used to validate --model before dispatch
+     * and to suggest the right ref when the caller drops the provider prefix.
+     * @returns {Promise<Set<string>>}
+     */
+    listModelRefs: async () => {
+      const r = await request("GET", "/provider");
+      const providers = Array.isArray(r) ? r : (r?.all ?? []);
+      const refs = new Set();
+      for (const p of providers) {
+        const pid = p?.id ?? p?.name;
+        if (!pid || !p?.models) continue;
+        for (const modelId of Object.keys(p.models)) refs.add(`${pid}/${modelId}`);
+      }
+      return refs;
+    },
+
     // Config
     getConfig: () => request("GET", "/config"),
 
@@ -547,4 +567,33 @@ export async function connect(opts = {}) {
   const { url } = await ensureServer(opts);
   const client = createClient(url, { directory: opts.cwd });
   return { ...client, serverInfo: { url } };
+}
+
+/**
+ * Given the server's valid model refs and a (possibly malformed) requested ref,
+ * suggest the closest correct full refs — chiefly when the caller passed the
+ * modelID without the provider prefix (e.g. "商汤/glm-5.2" instead of
+ * "volcano-coding/商汤/glm-5.2"). Returns up to `limit` suggestions, best first.
+ * @param {Set<string>|string[]} allRefs
+ * @param {string} requested
+ * @param {number} [limit]
+ * @returns {string[]}
+ */
+export function suggestModelRefs(allRefs, requested, limit = 5) {
+  const refs = Array.isArray(allRefs) ? allRefs : Array.from(allRefs ?? []);
+  const q = String(requested ?? "").trim();
+  if (!q) return [];
+  const tail = q.slice(q.indexOf("/") + 1); // model part if a slash is present
+  const scored = [];
+  for (const r of refs) {
+    if (r === q) return [r]; // exact — already valid
+    let score = 0;
+    if (r.endsWith(`/${q}`)) score = 100;              // just missing provider prefix
+    else if (r.endsWith(`/${tail}`)) score = 60;        // same model id, different group
+    else if (r.includes(q)) score = 40;
+    else if (tail && r.includes(tail)) score = 20;
+    if (score) scored.push([score, r]);
+  }
+  scored.sort((a, b) => b[0] - a[0] || a[1].length - b[1].length);
+  return scored.slice(0, limit).map(([, r]) => r);
 }

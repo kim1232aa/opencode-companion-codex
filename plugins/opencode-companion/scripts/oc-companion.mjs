@@ -16,7 +16,7 @@ import process from "node:process";
 import readline from "node:readline";
 
 import { isOpencodeInstalled, getOpencodeVersion } from "./lib/process.mjs";
-import { isServerRunning, connect, createClient } from "./lib/opencode-server.mjs";
+import { isServerRunning, connect, createClient, suggestModelRefs } from "./lib/opencode-server.mjs";
 import { loadState, updateState, upsertJob, jobDataPath } from "./lib/state.mjs";
 import {
   buildStatusSnapshot,
@@ -183,6 +183,31 @@ async function handleDelegate(args, requestId) {
       withWorktree({ dir: workspace, jobId: job.id, useWorktree, isWrite }, async (effectiveCwd) => {
         report("starting", "Connecting to OpenCode server...");
         const client = await connect({ cwd: effectiveCwd });
+
+        // Resolve the model ref up front. OpenCode's UI shows the provider's
+        // NAME (e.g. "freeapi") while a ref needs its ID (e.g. "volcano-coding"),
+        // and model ids themselves contain slashes — so callers routinely drop
+        // the provider prefix. If the dropped-prefix ref is UNAMBIGUOUS we fix
+        // it automatically (the token line then shows what actually ran); if it
+        // is ambiguous or unknown we fail fast with concrete suggestions instead
+        // of a cryptic mid-run 500.
+        if (args.model) {
+          const refs = await client.listModelRefs().catch(() => null);
+          if (refs && refs.size && !refs.has(args.model)) {
+            const exact = suggestModelRefs(refs, args.model, 50).filter((r) => r.endsWith(`/${args.model}`));
+            if (exact.length === 1) {
+              log(`Model "${args.model}" resolved to "${exact[0]}" (added the provider prefix).`);
+              args.model = exact[0];
+            } else {
+              const sugg = suggestModelRefs(refs, args.model);
+              throw new Error(
+                `Model "${args.model}" is not available on the OpenCode server.` +
+                (sugg.length ? ` Did you mean: ${sugg.join("  |  ")} ?` : "") +
+                ` A ref is <providerID>/<modelID>; the provider ID (e.g. volcano-coding) is NOT the name shown in OpenCode's UI (e.g. freeapi). Run oc_setup to list provider IDs.`
+              );
+            }
+          }
+        }
 
         let sessionId;
         if (resumeSessionId) {
