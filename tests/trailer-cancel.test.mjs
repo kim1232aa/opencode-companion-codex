@@ -43,7 +43,9 @@ describe("buildResultTrailer — concise one-line trailer (#12)", () => {
       { output: 1234, model: "glm-5.2" },
       { requestedModel: "glm-5.2", sessionId: "ses_abc", jobId: "oc_job1" }
     );
-    assert.equal(t, "\n✓ 1,234 out tok · model:glm-5.2 · job:oc_job1 · session:ses_abc");
+    // "OpenCode" prefix: the host prints its OWN "↓ N tokens" for what the turn
+    // cost IT — an unlabelled count here was being read as that.
+    assert.equal(t, "\n✓ OpenCode 1,234 out tok · model:glm-5.2 · job:oc_job1 · session:ses_abc");
     // A single content line (only the leading newline separator besides it).
     assert.equal(t.trim().split("\n").length, 1);
   });

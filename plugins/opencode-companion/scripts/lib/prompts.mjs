@@ -11,6 +11,8 @@ import { getDiff, getStatus, getChangedFiles } from "./git.mjs";
  * @param {string} [opts.base] - base branch/ref for comparison
  * @param {boolean} [opts.adversarial] - use adversarial review prompt
  * @param {string} [opts.focus] - user-supplied focus text
+ * @param {boolean} [opts.brief] - opt IN to the output budget (off by default here)
+ * @param {number} [opts.maxWords] - hard word cap; implies the budget
  * @param {string} pluginRoot - CLAUDE_PLUGIN_ROOT for reading prompt templates
  * @returns {Promise<string>}
  */
@@ -36,7 +38,15 @@ export async function buildReviewPrompt(cwd, opts, pluginRoot) {
     systemPrompt = buildStandardReviewPrompt(diff, status, changedFiles, opts);
   }
 
-  return systemPrompt + buildSchemaBlock(pluginRoot);
+  // Reviews are already bounded by the JSON schema below, so the output budget
+  // is OPT-IN here (unlike a free-form task, whose answer has no shape at all).
+  // When asked for, it tightens the PROSE inside the schema's fields without
+  // touching the schema contract itself.
+  const budget = wantsOutputBudget(opts)
+    ? buildOutputBudget({ brief: true, maxWords: opts.maxWords, structured: true })
+    : "";
+
+  return systemPrompt + (budget ? `\n\n${budget}` : "") + buildSchemaBlock(pluginRoot);
 }
 
 /**
@@ -143,9 +153,9 @@ function buildReviewContext(diff, status, changedFiles) {
  * carry routing rules inherited from AGENTS.md / the Codex conversation (e.g.
  * "delegate long tasks to the oc_delegate tool"). A model running INSIDE the
  * opencode session that obeys those rules will try to recursively invoke a
- * tool/plugin that does not exist here — the call errors and some models
- * (notably GLM) then stall indefinitely, emitting nothing. This header
- * neutralizes that without altering the forwarded task text itself.
+ * tool/plugin that does not exist here — the call errors, and some models
+ * then stall indefinitely, emitting nothing. This header neutralizes that
+ * without altering the forwarded task text itself.
  */
 export const SAFETY_HEADER = [
   "You are running INSIDE an OpenCode session, invoked as a worker by an",
@@ -185,10 +195,102 @@ export const HEADLESS_HEADER = [
 ].join(" ");
 
 /**
+ * Whether the output budget is ON when a caller says nothing about it.
+ *
+ * ON, deliberately. The work a dispatched job does is paid for on the worker
+ * side and costs the dispatcher nothing; the ANSWER is the only part that comes
+ * back. And it does not merely arrive — it lands in the dispatching agent's
+ * context and STAYS there for the rest of that agent's run, re-read on every
+ * later turn. Length in the answer is therefore a recurring cost, while length
+ * in the work is free. Nothing in a task prompt conveys that asymmetry, so
+ * models routinely return an essay where three lines and a file:line would do.
+ * Callers who genuinely want a long artifact opt out explicitly (brief: false).
+ */
+export const DEFAULT_BRIEF = true;
+
+/**
+ * The output-budget instruction: a SYSTEM constraint on the final answer only.
+ *
+ * Two things it must never do, both of which are why it is worded this way:
+ *   - make the worker do LESS WORK (it constrains the report, not the run), or
+ *   - touch the forwarded task text (it is a prefix, like the headers above).
+ * Deliberately provider-neutral: this is a public plugin.
+ */
+export const OUTPUT_BUDGET_HEADER = [
+  "OUTPUT BUDGET — this constrains what you REPORT, not how much work you do.",
+  "Your final answer is handed back to the agent that dispatched you and then",
+  "STAYS in that agent's context for the rest of its run: it is re-read on every",
+  "later turn, so every extra line costs again and again. Investigate as deeply",
+  "as the task needs — but report it SHORT by default:",
+  "lead with the conclusion / what you changed;",
+  "back each claim with a locator (file:line, the exact command, or the few key",
+  "lines) instead of reproducing whole files, whole diffs or long logs;",
+  "no preamble, no restating of the task, no pleasantries, no closing summary of",
+  "what you just said.",
+  "If a detail does not fit, name where it can be read in full (\"full diff: git",
+  "diff <path>\") instead of padding the answer with it.",
+  "Write at length ONLY where the task explicitly asks for a long or complete",
+  "artifact.",
+].join(" ");
+
+/**
+ * Compose the output-budget block for a dispatch.
+ * @param {object} opts
+ * @param {boolean} [opts.brief] - budget on/off; defaults to {@link DEFAULT_BRIEF}
+ * @param {number} [opts.maxWords] - hard word cap for the final answer
+ * @param {boolean} [opts.structured] - the caller also imposes an output schema
+ * @returns {string} "" when the budget is off
+ */
+export function buildOutputBudget(opts = {}) {
+  const brief = opts.brief === undefined ? DEFAULT_BRIEF : !!opts.brief;
+  // brief:false is a real escape hatch: it drops the cap with the budget, so a
+  // caller that asked for long output never gets a word limit smuggled back in.
+  if (!brief) return "";
+
+  const blocks = [OUTPUT_BUDGET_HEADER];
+
+  const n = Math.floor(Number(opts.maxWords));
+  if (Number.isFinite(n) && n > 0) {
+    blocks.push(
+      `HARD LIMIT: keep the final answer under ${n} words. If it does not fit, keep the ` +
+      "conclusion and the locators, drop the elaboration, and say plainly what you left out " +
+      "and where it can be read in full. Never pad to reach the limit, and never cut off " +
+      "mid-thought to stay under it."
+    );
+  }
+
+  if (opts.structured) {
+    blocks.push(
+      "This budget applies to the PROSE inside the required output fields. It does NOT relax " +
+      "the output contract below: still return every required field, in the required format."
+    );
+  }
+
+  return blocks.join("\n\n");
+}
+
+/**
+ * Whether a caller explicitly asked for an output budget (used where the budget
+ * is opt-in rather than defaulted, i.e. schema-bounded reviews).
+ * @param {object} [opts]
+ * @returns {boolean}
+ */
+export function wantsOutputBudget(opts = {}) {
+  return opts.brief === true || Number(opts.maxWords) > 0;
+}
+
+/**
  * Build a task prompt from user input.
+ *
+ * Layout is a contract: SYSTEM prefixes first (safety → headless → output
+ * budget → access mode), then the task text VERBATIM as the trailing block.
+ * Nothing here may rewrite, summarize or wrap the task text.
+ *
  * @param {string} taskText
  * @param {object} opts
  * @param {boolean} [opts.write] - whether to allow writes
+ * @param {boolean} [opts.brief] - output budget; defaults to {@link DEFAULT_BRIEF}
+ * @param {number} [opts.maxWords] - hard word cap for the final answer
  * @returns {string}
  */
 export function buildTaskPrompt(taskText, opts = {}) {
@@ -198,6 +300,12 @@ export function buildTaskPrompt(taskText, opts = {}) {
   parts.push("");
   parts.push(HEADLESS_HEADER);
   parts.push("");
+
+  const budget = buildOutputBudget(opts);
+  if (budget) {
+    parts.push(budget);
+    parts.push("");
+  }
 
   if (opts.write) {
     parts.push("You have full read/write access. Make the necessary code changes.");

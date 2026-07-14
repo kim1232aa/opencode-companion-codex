@@ -73,6 +73,13 @@ and try:
 
 - `agent: "plan"` is the only read-only mode; the default `build` agent has
   full write access.
+- A delegated run is **unattended** — nobody can answer a question, so a model
+  that stops to ask just hangs until the watchdog kills it. Make the task text
+  self-contained and append the ready-made follow-through block from
+  [`skills/delegate/references/unattended-run.md`](plugins/opencode-companion/skills/delegate/references/unattended-run.md)
+  when the request is at all ambiguous.
+- To list real provider/model ids, run `oc_setup` or `opencode models` — never
+  read `auth.json` or any other credential file.
 - For a write task in a repo you're editing concurrently, ask for
   `worktree: true` — OpenCode works in an isolated git worktree and the changes
   are applied back (conflicts are surfaced, never silently clobbered).

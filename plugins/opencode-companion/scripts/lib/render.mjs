@@ -32,7 +32,9 @@ export function isEmptyResult(resultData) {
 // token count and how long ago the newest log line was written (staleness).
 // Lets a caller tell "generating" (tokens up / fresh) from "stuck" (stale) from
 // "done/errored" — the exact judgment that a bare "running" label can't give.
-function liveSignal(progressPreview) {
+// Exported so the cross-workspace `watch` panel reads a job's live signal the
+// SAME way `status` does, instead of growing a second copy of this parsing.
+export function liveSignal(progressPreview) {
   if (typeof progressPreview !== "string" || !progressPreview) return {};
   const lines = progressPreview.split("\n").filter(Boolean);
   let tokens = null;
@@ -50,8 +52,9 @@ function liveSignal(progressPreview) {
 // Pull the last few "activity:" lines out of a running job's log tail — the
 // internal tool calls (bash/edit/read …) that dispatchWithRetry records — so
 // status can show what OpenCode is doing, not just a token count. Kept to a
-// small `max` so the preview never floods.
-function recentActivity(progressPreview, max = 2) {
+// small `max` so the preview never floods. Exported for the same reason as
+// liveSignal: one implementation, shared by `status` and the `watch` panel.
+export function recentActivity(progressPreview, max = 2) {
   if (typeof progressPreview !== "string" || !progressPreview) return [];
   const lines = progressPreview.split("\n").filter(Boolean);
   const acts = [];
@@ -82,7 +85,11 @@ export function renderStatus(snapshot) {
     for (const job of running) {
       const { tokens, ageSec } = liveSignal(job.progressPreview);
       const bits = [`${STATUS_ICON[job.status] ?? "🟢"} **${job.id}** (${job.type})`, job.phase ?? "running", job.elapsed ?? "just started"];
-      if (tokens) bits.push(`${tokens} tokens`);
+      // Say WHOSE tokens. The host UI (Claude Code / Codex) shows its own
+      // "↓ N tokens" counter for what IT spends on this turn; an unlabelled
+      // number here was being read as that. This one is burned on the delegated
+      // OpenCode backend and is NOT billed to the host's quota.
+      if (tokens) bits.push(`${tokens} OpenCode tokens`);
       if (ageSec != null) bits.push(`updated ${ageSec}s ago${ageSec > 120 ? " ⚠️ possibly stuck" : ""}`);
       lines.push(`- ${bits.join(" · ")}`);
       // Show the last 1-2 internal tool calls (bash/edit/read …) instead of
@@ -92,7 +99,7 @@ export function renderStatus(snapshot) {
       for (const a of acts) lines.push(`  ↳ ${a}`);
     }
     lines.push("");
-    lines.push("_Tokens rising between two checks = generating. Same tokens + a large \"updated … ago\" = stuck. Failed/❌ or ⚠️ no-output = did not succeed._");
+    lines.push("_Token counts above are OPENCODE-side usage — burned on the delegated backend, NOT billed to your Claude/Codex quota (the host's own \"↓ N tokens\" is a different number). Rising between two checks = generating. Frozen + a large \"updated … ago\" = stuck. Failed/❌ or ⚠️ no-output = did not succeed._");
     lines.push("");
   }
 
@@ -174,7 +181,7 @@ export function renderResult(job, resultData) {
     }
     const usageLine = formatUsage(resultData.usage, { requestedModel: resultData.requestedModel });
     if (usageLine) {
-      lines.push(`\n### Token Usage\n`);
+      lines.push(`\n### Token Usage — OpenCode side (not billed to your Claude/Codex quota)\n`);
       lines.push(usageLine);
     }
   } else if (job.result) {
@@ -230,7 +237,7 @@ export function formatUsage(usage, opts = {}) {
 }
 /**
  * One-line result trailer for the immediate delegate/result stdout, e.g.
- *   "✓ 1,234 out tok · model:my-model · session:abc123"
+ *   "✓ OpenCode 1,234 out tok · model:my-model · session:abc123"
  * so the tail is a single line instead of a multi-line block. Correctness
  * signals are preserved: a model mismatch flips the leading mark to ⚠️ and
  * spells out ran-vs-requested. The full multi-line breakdown still lives in
@@ -251,8 +258,11 @@ export function formatTrailer(usage, opts = {}) {
     ? opts.requestedModel.trim() : null;
   const mismatch = !!(observed && requested && observed !== requested);
   const bits = [];
-  if (out) bits.push(`${out.toLocaleString()} out tok`);
-  else if (total) bits.push(`${total.toLocaleString()} tok`);
+  // "OpenCode" prefix is deliberate: the host (Claude Code / Codex) prints its
+  // OWN "↓ N tokens" for what the turn cost IT, and an unlabelled count here was
+  // being mistaken for that. These are the delegated backend's tokens.
+  if (out) bits.push(`OpenCode ${out.toLocaleString()} out tok`);
+  else if (total) bits.push(`OpenCode ${total.toLocaleString()} tok`);
   if (cost > 0) bits.push(`~$${cost.toFixed(4)}`);
   if (mismatch) bits.push(`model ran ${observed} (NOT requested ${requested})`);
   else if (observed) bits.push(`model:${observed}`);

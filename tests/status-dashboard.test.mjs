@@ -13,7 +13,7 @@ describe("renderStatus — multi-agent dashboard", () => {
       ],
       recent: [], latestFinished: null,
     });
-    assert.match(out, /143,206 tokens/);
+    assert.match(out, /143,206 OpenCode tokens/);
     assert.match(out, /updated \d+s ago/);
     assert.match(out, /possibly stuck/); // the 5-min-stale one
     assert.match(out, /Running Jobs \(2\)/);

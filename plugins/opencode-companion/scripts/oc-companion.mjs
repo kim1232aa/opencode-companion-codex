@@ -37,7 +37,7 @@ import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.4.0";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // Plugin root — the directory that holds prompts/ and schemas/. Reviews read
@@ -102,6 +102,42 @@ export function buildResultTrailer(usage, { requestedModel, sessionId, jobId } =
 // requestId → { sessionId, jobId, workspace } for notifications/cancelled.
 const inflight = new Map();
 
+// ─── Output budget ──────────────────────────────────────────────────────────
+
+// Shared wording for the brief/maxWords tool params. A delegated answer is
+// returned INTO this caller's context and re-read on every later turn, while the
+// delegated work itself costs the caller nothing — so the answer is the only
+// part of a delegation that keeps billing, and it is capped by default.
+const BRIEF_PARAM_DESC =
+  "Keep the returned answer short: conclusion plus locators (file:line, commands), no whole-file or whole-diff dumps, no filler. " +
+  "Defaults to TRUE — the result lands in YOUR context and is re-read on every later turn, so its length is a recurring cost while the delegated work is free. " +
+  "Set false only when you actually want the long form (a full report, a generated document). It never limits how much WORK is done, only how much is reported.";
+const MAX_WORDS_PARAM_DESC =
+  "Hard word cap on the returned answer (e.g. 200). Implies brief. Anything that does not fit is replaced by a pointer to where it can be read in full.";
+
+/**
+ * Validate and normalize the output-budget arguments of a tool call.
+ * @param {object} [args]
+ * @returns {{ brief?: boolean, maxWords?: number, error?: string }}
+ *   `brief: undefined` means the caller said nothing — the default then lives in
+ *   ONE place (prompts.mjs DEFAULT_BRIEF) instead of being re-decided here.
+ */
+export function readOutputBudget(args = {}) {
+  if (args.brief !== undefined && typeof args.brief !== "boolean") {
+    return { error: "Error: brief, if supplied, must be a boolean." };
+  }
+  if (args.maxWords !== undefined) {
+    const n = Number(args.maxWords);
+    if (!Number.isFinite(n) || n <= 0) {
+      return { error: "Error: maxWords, if supplied, must be a positive number." };
+    }
+    // An explicit brief:false drops the cap with the budget — a caller that asked
+    // for the long form never gets a word limit smuggled back in.
+    return { brief: args.brief, maxWords: args.brief === false ? undefined : Math.floor(n) };
+  }
+  return { brief: args.brief, maxWords: undefined };
+}
+
 // ─── Workspace ──────────────────────────────────────────────────────────────
 
 export async function resolveWorkspaceArg(args) {
@@ -120,7 +156,7 @@ const TOOLS = [
   {
     name: "oc_delegate",
     description:
-      "Delegate a coding task to OpenCode (running on any OpenAI-compatible backend) and BLOCK until it finishes, returning the full result plus a token-usage line. This single call is the whole delegation: do not poll, sleep, or emit waiting commentary while it is pending. Long tasks (15-30+ min) are normal.",
+      "Delegate a coding task to OpenCode (running on any OpenAI-compatible backend) and BLOCK until it finishes, returning the full result plus a token-usage line. This single call is the whole delegation: do not poll, sleep, or emit waiting commentary while it is pending. Long tasks (15-30+ min) are normal. NOTE the cost shape: the WORK runs on OpenCode and costs you nothing, but the RESULT is returned into your context and re-read on every later turn — so the answer is capped by default (brief), and you should leave it that way unless you truly need the long form.",
     inputSchema: {
       type: "object",
       properties: {
@@ -128,6 +164,8 @@ const TOOLS = [
         model: { type: "string", description: "Optional provider/model ref (split on the FIRST slash; model ids may contain slashes). Omit for the provider default." },
         agent: { type: "string", enum: ["build", "plan"], description: "OpenCode agent. 'build' (default) has full write access; 'plan' is the ONLY read-only mode." },
         worktree: { type: "boolean", description: "Run a write-capable task in an isolated throwaway git worktree and apply the changes back (protects concurrent edits in the live repo)." },
+        brief: { type: "boolean", description: BRIEF_PARAM_DESC },
+        maxWords: { type: "number", description: MAX_WORDS_PARAM_DESC },
         resumeSession: { type: "string", description: "Explicit OpenCode session id to continue instead of starting fresh." },
         workspace: { type: "string", description: "Absolute path of the repository/workspace to operate in. Defaults to the server's cwd." },
       },
@@ -137,7 +175,7 @@ const TOOLS = [
   {
     name: "oc_delegate_batch",
     description:
-      "Delegate SEVERAL independent coding tasks to OpenCode IN PARALLEL with a single call, blocking until ALL finish, and return every result. Use this instead of multiple oc_delegate calls whenever you have 2+ independent tasks (e.g. fanning out to different models or reviewing different modules) — the host executes MCP tools sequentially, so batching is the only way to get true parallelism. Same no-polling rule as oc_delegate.",
+      "Delegate SEVERAL independent coding tasks to OpenCode IN PARALLEL with a single call, blocking until ALL finish, and return every result. Use this instead of multiple oc_delegate calls whenever you have 2+ independent tasks (e.g. fanning out to different models or reviewing different modules) — the host executes MCP tools sequentially, so batching is the only way to get true parallelism. Same no-polling rule as oc_delegate. Every result lands in YOUR context, so N tasks means N answers to carry for the rest of the run: the per-task answer is capped by default (brief), and a partial failure still returns the tasks that did succeed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -152,6 +190,8 @@ const TOOLS = [
               model: { type: "string", description: "Optional provider/model ref for THIS task." },
               agent: { type: "string", enum: ["build", "plan"], description: "'build' (default, write) or 'plan' (read-only)." },
               worktree: { type: "boolean", description: "Isolate this write task in a throwaway git worktree. Strongly recommended when several write tasks in the batch touch the same repository." },
+              brief: { type: "boolean", description: BRIEF_PARAM_DESC },
+              maxWords: { type: "number", description: MAX_WORDS_PARAM_DESC },
               label: { type: "string", description: "Optional short label echoed back with this task's result." },
             },
             required: ["task"],
@@ -210,6 +250,8 @@ const TOOLS = [
       properties: {
         base: { type: "string", description: "Optional base branch/ref to diff against (e.g. 'main'). Omit to review uncommitted working-tree changes." },
         model: { type: "string", description: "Optional provider/model ref (split on the FIRST slash). Omit for the provider default." },
+        brief: { type: "boolean", description: "Tighten the PROSE inside the review's findings (summary/body/recommendation): conclusion plus locators, no padding. The JSON schema and every required field are unaffected. Unlike oc_delegate this is OPT-IN — review output is already bounded by the schema." },
+        maxWords: { type: "number", description: "Optional word cap for the review's prose fields. Implies brief. Never drops a required field — it only shortens the writing inside them." },
         workspace: { type: "string", description: "Absolute path of the repository to review. Defaults to the server's cwd." },
       },
     },
@@ -224,6 +266,8 @@ const TOOLS = [
         base: { type: "string", description: "Optional base branch/ref to diff against. Omit to review uncommitted working-tree changes." },
         focus: { type: "string", description: "Optional focus area to weight heavily (e.g. 'concurrency', 'the migration path')." },
         model: { type: "string", description: "Optional provider/model ref (split on the FIRST slash). Omit for the provider default." },
+        brief: { type: "boolean", description: "Tighten the PROSE inside the findings (summary/body/recommendation). The JSON schema and every required field are unaffected. OPT-IN: review output is already schema-bounded." },
+        maxWords: { type: "number", description: "Optional word cap for the review's prose fields. Implies brief. Never drops a required field." },
         workspace: { type: "string", description: "Absolute path of the repository to review. Defaults to the server's cwd." },
       },
     },
@@ -249,6 +293,8 @@ async function handleDelegate(args, requestId) {
   if (args.model !== undefined && (typeof args.model !== "string" || !args.model.trim())) {
     return errText("Error: model, if supplied, must be a non-empty provider/model string.");
   }
+  const budget = readOutputBudget(args);
+  if (budget.error) return errText(budget.error);
   const agentName = args.agent === "plan" ? "plan" : "build";
   const isWrite = agentName !== "plan";
   const useWorktree = !!args.worktree && isWrite;
@@ -290,9 +336,9 @@ async function handleDelegate(args, requestId) {
           }
         }
 
-        const prompt = buildTaskPrompt(task, { write: isWrite });
+        const prompt = buildTaskPrompt(task, { write: isWrite, brief: budget.brief, maxWords: budget.maxWords });
         report("investigating", "Running task...");
-        log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars, Model: ${args.model ?? "(provider default)"}`);
+        log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars, Model: ${args.model ?? "(provider default)"}, Brief: ${budget.brief === false ? "off" : "on"}${budget.maxWords ? `, MaxWords: ${budget.maxWords}` : ""}`);
 
         // Dispatch with retries: a transient 500, an empty turn, or a hang (no
         // token progress) is retried on a fresh session instead of failing.
@@ -369,6 +415,11 @@ export async function handleDelegateBatch(args, requestId, deps = {}) {
     if (!t || typeof t.task !== "string" || !t.task.trim()) {
       return errText(`Error: tasks[${i}].task is required and must be a non-empty string.`);
     }
+    // Reject a malformed budget BEFORE dispatching anything: an unusable
+    // brief/maxWords on task 3 must not be discovered after tasks 1-2 have
+    // already burned a run.
+    const budget = readOutputBudget(t);
+    if (budget.error) return errText(budget.error.replace(/^Error: /, `Error: tasks[${i}].`));
   }
   const workspace = typeof args.workspace === "string" ? args.workspace : undefined;
 
@@ -388,7 +439,10 @@ export async function handleDelegateBatch(args, requestId, deps = {}) {
   const results = await Promise.all(
     tasks.map((t, i) =>
       runDelegate(
-        { task: t.task, model: t.model, agent: t.agent, worktree: t.worktree, workspace },
+        {
+          task: t.task, model: t.model, agent: t.agent, worktree: t.worktree,
+          brief: t.brief, maxWords: t.maxWords, workspace,
+        },
         undefined // batch-level cancellation is handled via oc_cancel per job
       ).then((r) => ({
         label: typeof t.label === "string" && t.label.trim() ? t.label.trim() : `task ${i + 1}`,
@@ -550,6 +604,8 @@ async function runReview(args, requestId, { adversarial }) {
       return errText("Error: invalid base ref (only branch/tag/commit-ref characters are allowed).");
     }
   }
+  const budget = readOutputBudget(args);
+  if (budget.error) return errText(budget.error);
   const focus = adversarial && typeof args.focus === "string" && args.focus.trim() ? args.focus.trim() : undefined;
   const workspace = await resolveWorkspaceArg(args);
   const type = adversarial ? "adversarial-review" : "review";
@@ -563,7 +619,14 @@ async function runReview(args, requestId, { adversarial }) {
 
       // Prompt is built from the repo's git diff/status; the adversarial variant
       // reads its template from PLUGIN_ROOT/prompts/adversarial-review.md.
-      const prompt = await buildReviewPrompt(workspace, { base, adversarial, focus }, PLUGIN_ROOT);
+      // brief/maxWords here tighten the PROSE inside the schema's fields; the
+      // JSON output contract itself is untouched (buildReviewPrompt keeps the
+      // budget opt-in for exactly that reason).
+      const prompt = await buildReviewPrompt(
+        workspace,
+        { base, adversarial, focus, brief: budget.brief, maxWords: budget.maxWords },
+        PLUGIN_ROOT
+      );
 
       report("reviewing", adversarial ? "Running adversarial review..." : "Running review...");
       log(`Prompt: ${prompt.length} chars${focus ? `, focus: ${focus}` : ""}${args.model ? `, model: ${args.model}` : ""}`);

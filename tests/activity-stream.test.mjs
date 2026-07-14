@@ -144,7 +144,7 @@ describe("renderStatus — surfaces recent activity lines under a running job", 
       recent: [], latestFinished: null,
     });
     // token count still shown in the header bits
-    assert.match(out, /12,000 tokens/);
+    assert.match(out, /12,000 OpenCode tokens/);
     // most recent two activity lines surface (bash + edit), README (oldest) trimmed
     assert.match(out, /↳ bash: npm test/);
     assert.match(out, /↳ edit: src\/a\.mjs/);

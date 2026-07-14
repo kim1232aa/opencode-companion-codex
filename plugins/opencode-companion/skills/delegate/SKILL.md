@@ -8,79 +8,51 @@ description: Delegate a coding task from Codex to OpenCode running on a cheap Op
 Call the `oc_delegate` MCP tool with the task text. The call BLOCKS until the
 OpenCode run finishes and returns the full result plus a token-usage line.
 
-**Two or more independent tasks? Use `oc_delegate_batch` in ONE call** — the
-host runs MCP tools sequentially, so issuing several `oc_delegate` calls
-executes them one-by-one; `oc_delegate_batch` runs the whole array in parallel
-server-side and returns every result (each with its own token line and
-resumable session). Give each entry a short `label`. For multiple WRITE tasks
-touching the same repository, set `worktree: true` on each so they can't
-trample each other.
+**Two or more independent tasks? Use `oc_delegate_batch` in ONE call** — the host
+runs MCP tools sequentially, so several `oc_delegate` calls execute one-by-one;
+`oc_delegate_batch` runs the whole array in parallel server-side and returns every
+result (each with its own token line and resumable session). Give each entry a
+short `label`. For multiple WRITE tasks on the same repository, set
+`worktree: true` on each so they can't trample each other.
 
-## Rules
+## Iron rules
 
 - **One call is the whole delegation.** While `oc_delegate` is pending, do not
-  sleep, do not poll `oc_status`, do not emit periodic "still waiting" turns,
-  and never emulate the delegation through shell commands. Long tasks
-  (15–30+ minutes) are normal; the MCP call simply stays pending.
-- **The task text must be self-contained.** OpenCode sees only that text plus
-  the repository — restate every constraint, path, and acceptance criterion
-  the conversation established. Forward user task text verbatim; do not
-  summarize or "tighten" it.
+  sleep, do not poll `oc_status`, do not emit periodic "still waiting" turns, and
+  never emulate the delegation through shell commands. Long tasks (15–30+ minutes)
+  are normal; the MCP call simply stays pending.
+- **The task text must be self-contained.** OpenCode sees only that text plus the
+  repository — restate every constraint, path, and acceptance criterion the
+  conversation established. Forward user task text verbatim; never summarize or
+  "tighten" it.
+- **The run is UNATTENDED — a question kills it.** Nobody is on the other end: if
+  the model stops to ask, the run hangs until the watchdog kills it, the retry
+  hangs the same way, and the spend is wasted. A mid-run question is a *prompt
+  bug*. Never write text that invites one ("let me know if…", "confirm before
+  proceeding"). When the request has any ambiguity, append the ready-made block
+  from [references/unattended-run.md](references/unattended-run.md).
 - **Write vs read-only**: `agent: "build"` (default) has full write access;
   `agent: "plan"` is the ONLY read-only mode. Choose `plan` only when the user
   explicitly wants no changes ("review only", "don't modify anything") — an
   investigative-sounding request is not by itself read-only.
-- **Model**: pass `model` as `<providerID>/<modelID>`.
-  - The provider ID is the OpenCode PROVIDER id from your opencode config —
-    **not** the provider *display name* OpenCode's UI may show, and not the
-    grouping shown next to the model.
-  - The modelID often contains slashes itself (e.g. a combo router's
-    `group/model-name`), so a full ref like `myprovider/group/model-name`
-    legitimately has several slashes — the split is on the FIRST slash only.
-  - If you pass a modelID without its provider prefix and it is unambiguous, the
-    tool auto-adds the prefix and the result's `Model:` line shows what actually
-    ran; if it is ambiguous or unknown, the tool returns concrete suggestions.
-  - **To list the real provider/model IDs, run `oc_setup` — or `opencode models`.
-    Those are the only two supported ways.** Never read
-    `~/.local/share/opencode/auth.json` or any other credential/token file to
-    enumerate providers: it holds plaintext tokens, reading it is blocked by the
-    permission layer (correctly), and it is never necessary.
+- **Never read `~/.local/share/opencode/auth.json` or any credential/token file to
+  enumerate providers.** Run `oc_setup` — or `opencode models`. Those are the only
+  two supported ways. Model-ref rules (the FIRST-slash split, provider ids,
+  auto-prefixing): [references/model-and-credentials.md](references/model-and-credentials.md).
 - **Concurrent-edit safety**: for a write task in a repo someone may be editing
-  concurrently, set `worktree: true` — OpenCode works in an isolated git
-  worktree and the changes are applied back at the end.
+  concurrently, set `worktree: true` — OpenCode works in an isolated git worktree
+  and the changes are applied back at the end.
 - **Follow-ups**: prefer a fresh delegation with a bounded handoff (objective,
   current findings, constraints, acceptance checks) over resuming. Pass
-  `resumeSession` only when the user explicitly wants the same OpenCode
-  session continued; its id is printed at the end of every result. If a
-  resumable session exists but the user did not clearly ask to continue,
-  **start fresh** (the default) and say so in one line — never stall waiting
-  for a choice nobody is there to make.
-- **The delegated run is UNATTENDED — never let OpenCode ask a question.**
-  Nobody is on the other end of a delegation: if the model stops to ask for
-  clarification, the run hangs until the watchdog kills it, the retry hangs the
-  same way, and the spend is wasted. A question mid-run is a *prompt bug*.
-  - Never write task text that invites one ("let me know if…", "confirm before
-    proceeding", "ask me which approach you prefer").
-  - When the request has any ambiguity, append this to the task text:
-
-    ```
-    This is a non-interactive, unattended run. Nobody can answer a question.
-    Do not ask for clarification or confirmation — there is no one to reply.
-    Default to the most reasonable low-risk interpretation and keep going.
-    If a detail is genuinely undecidable, pick the safest option, proceed, and
-    record the assumption in your final answer under "Assumptions".
-    Resolve the task fully before stopping. Do not stop at the first plausible
-    answer, and do not stop after identifying the issue without applying the fix.
-    ```
-
-  - Most questions come from missing context — a task text that fully specifies
-    paths, constraints, and the end state does not produce one. Ask for an
-    "Assumptions" / "Open questions" section in the *output* instead of a
-    mid-run question.
+  `resumeSession` only when the user explicitly wants the same OpenCode session
+  continued; its id is printed at the end of every result. If a resumable session
+  exists but the user did not clearly ask to continue, **start fresh** (the
+  default) and say so in one line — never stall waiting for a choice nobody is
+  there to make.
 
 ## If the call is interrupted
 
-The run usually keeps going server-side. Use `oc_result` to recover the
-finished answer (it is marked `recovered`); check `oc_status` to see live
-token-progress heartbeats first. Never conclude the work is lost without
-trying `oc_result`.
+The run usually keeps going server-side. Use `oc_result` to recover the finished
+answer (it is marked `recovered`); check `oc_status` first to see live
+token-progress heartbeats. Never conclude the work is lost without trying
+`oc_result`.
