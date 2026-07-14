@@ -37,7 +37,7 @@ import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.2.1";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // Plugin root — the directory that holds prompts/ and schemas/. Reviews read
@@ -265,9 +265,9 @@ async function handleDelegate(args, requestId) {
         report("starting", "Connecting to OpenCode server...");
         const client = await connect({ cwd: effectiveCwd });
 
-        // Resolve the model ref up front. OpenCode's UI shows the provider's
-        // NAME (e.g. "freeapi") while a ref needs its ID (e.g. "volcano-coding"),
-        // and model ids themselves contain slashes — so callers routinely drop
+        // Resolve the model ref up front. OpenCode's UI can show a provider
+        // display NAME that differs from the ID a ref needs, and model ids
+        // themselves can contain slashes — so callers routinely drop
         // the provider prefix. If the dropped-prefix ref is UNAMBIGUOUS we fix
         // it automatically (the token line then shows what actually ran); if it
         // is ambiguous or unknown we fail fast with concrete suggestions instead
@@ -284,7 +284,7 @@ async function handleDelegate(args, requestId) {
               throw new Error(
                 `Model "${args.model}" is not available on the OpenCode server.` +
                 (sugg.length ? ` Did you mean: ${sugg.join("  |  ")} ?` : "") +
-                ` A ref is <providerID>/<modelID>; the provider ID (e.g. volcano-coding) is NOT the name shown in OpenCode's UI (e.g. freeapi). Run oc_setup to list provider IDs.`
+                ` A ref is <providerID>/<modelID>; the providerID is the id from your opencode config (not necessarily the display name OpenCode's UI shows), and the modelID may itself contain slashes. Run oc_setup to list the exact provider IDs.`
               );
             }
           }

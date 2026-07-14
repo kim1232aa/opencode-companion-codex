@@ -31,13 +31,12 @@ trample each other.
   explicitly wants no changes ("review only", "don't modify anything") — an
   investigative-sounding request is not by itself read-only.
 - **Model**: pass `model` as `<providerID>/<modelID>`.
-  - The provider ID is the OpenCode PROVIDER (e.g. `volcano-coding`) — **not**
-    the provider *name* shown in OpenCode's UI (e.g. `freeapi`), and not the
+  - The provider ID is the OpenCode PROVIDER id from your opencode config —
+    **not** the provider *display name* OpenCode's UI may show, and not the
     grouping shown next to the model.
   - The modelID often contains slashes itself (e.g. a combo router's
-    `火山方舟Coding_Plan/glm-5.2` or `商汤/glm-5.2`), so a full ref like
-    `volcano-coding/商汤/glm-5.2` legitimately has several slashes — the split is
-    on the FIRST slash only.
+    `group/model-name`), so a full ref like `myprovider/group/model-name`
+    legitimately has several slashes — the split is on the FIRST slash only.
   - If you pass a modelID without its provider prefix and it is unambiguous, the
     tool auto-adds the prefix and the result's `Model:` line shows what actually
     ran; if it is ambiguous or unknown, the tool returns concrete suggestions.

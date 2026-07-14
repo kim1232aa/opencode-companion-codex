@@ -230,7 +230,7 @@ export function formatUsage(usage, opts = {}) {
 }
 /**
  * One-line result trailer for the immediate delegate/result stdout, e.g.
- *   "✓ 1,234 out tok · model:glm-5.2 · session:abc123"
+ *   "✓ 1,234 out tok · model:my-model · session:abc123"
  * so the tail is a single line instead of a multi-line block. Correctness
  * signals are preserved: a model mismatch flips the leading mark to ⚠️ and
  * spells out ran-vs-requested. The full multi-line breakdown still lives in

@@ -551,8 +551,8 @@ export function createClient(baseUrl, opts = {}) {
 
     /**
      * All valid model refs the server knows, as a Set of "<providerID>/<modelID>"
-     * strings. providerID is the OpenCode provider (e.g. "volcano-coding"); the
-     * modelID may itself contain slashes (e.g. "火山方舟Coding_Plan/glm-5.2"), so a
+     * strings. providerID is the OpenCode provider id; the modelID may itself
+     * contain slashes (e.g. "group/model-name"), so a
      * full ref can have several slashes. Used to validate --model before dispatch
      * and to suggest the right ref when the caller drops the provider prefix.
      * @returns {Promise<Set<string>>}
@@ -595,8 +595,8 @@ export async function connect(opts = {}) {
 /**
  * Given the server's valid model refs and a (possibly malformed) requested ref,
  * suggest the closest correct full refs — chiefly when the caller passed the
- * modelID without the provider prefix (e.g. "商汤/glm-5.2" instead of
- * "volcano-coding/商汤/glm-5.2"). Returns up to `limit` suggestions, best first.
+ * modelID without the provider prefix (e.g. "group/model" instead of the full
+ * "provider/group/model"). Returns up to `limit` suggestions, best first.
  * @param {Set<string>|string[]} allRefs
  * @param {string} requested
  * @param {number} [limit]

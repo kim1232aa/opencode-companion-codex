@@ -10,8 +10,8 @@ describe("parseModelRef", () => {
 
   it("keeps later slashes in the model id (custom combo ids)", () => {
     assert.deepEqual(
-      parseModelRef("volcano/plan/deepseek-v4-pro"),
-      { providerID: "volcano", modelID: "plan/deepseek-v4-pro" }
+      parseModelRef("myprovider/group/model-name"),
+      { providerID: "myprovider", modelID: "group/model-name" }
     );
   });
 
