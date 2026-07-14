@@ -158,6 +158,33 @@ export const SAFETY_HEADER = [
 ].join(" ");
 
 /**
+ * Prepended to every task prompt, immediately after SAFETY_HEADER.
+ *
+ * A dispatched job runs UNATTENDED: no human is watching the opencode session.
+ * OpenCode nonetheless exposes a `question` tool, and a model that calls it to
+ * ask for a choice or a clarification then blocks forever waiting for an answer
+ * nobody can give. Observed in the wild as: `activity: question`, then a frozen
+ * token count until the stall watchdog killed the turn 120s later — and the
+ * retry hung exactly the same way, turning a one-minute task into a three-minute
+ * failure. The runtime now auto-rejects those calls (watchAndRejectQuestions in
+ * opencode-server.mjs), but a rejected question still burns a turn, so the model
+ * is told up front not to ask at all.
+ *
+ * This is a SYSTEM prefix: it constrains how the worker behaves and does NOT
+ * alter the task text, which is still forwarded verbatim below it.
+ */
+export const HEADLESS_HEADER = [
+  "You are running UNATTENDED, in a non-interactive session. There is NO human",
+  "available to answer you. Do NOT call any question / ask / clarification tool,",
+  "do NOT request confirmation, and do NOT wait for user input — such a call is",
+  "auto-rejected and only wastes a turn. If the task is ambiguous, choose the",
+  "most reasonable interpretation, state that assumption explicitly in your",
+  "final answer, and carry on. If some information is genuinely unavailable,",
+  "still finish the turn: give the best answer you can, and say plainly what was",
+  "missing and what you assumed instead. Never end your turn with a question.",
+].join(" ");
+
+/**
  * Build a task prompt from user input.
  * @param {string} taskText
  * @param {object} opts
@@ -168,6 +195,8 @@ export function buildTaskPrompt(taskText, opts = {}) {
   const parts = [];
 
   parts.push(SAFETY_HEADER);
+  parts.push("");
+  parts.push(HEADLESS_HEADER);
   parts.push("");
 
   if (opts.write) {

@@ -16,3 +16,12 @@ Call the `oc_setup` MCP tool and report its output.
 - **Providers: none** — delegation will fail; point the user at their
   OpenCode provider configuration. This plugin never stores or edits
   credentials itself.
+
+## Listing providers and models
+
+- Use `oc_setup`, or `opencode models`. Those are the only two supported ways.
+- **Never read `~/.local/share/opencode/auth.json` — or any other credential,
+  token, or auth file — to enumerate providers or models.** It stores plaintext
+  tokens. Reading it is blocked by the permission layer (correctly), and it is
+  never necessary: `oc_setup` / `opencode models` already returns the real
+  provider and model ids. This plugin never reads, stores, or edits credentials.

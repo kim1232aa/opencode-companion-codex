@@ -291,6 +291,92 @@ function watchAndRejectPermissions(baseUrl, headers, sessionId) {
   return { stop: () => { stopped = true; } };
 }
 
+const QUESTION_POLL_INTERVAL_MS = 3000;
+
+/**
+ * Poll GET /question and auto-reject any pending question for this session.
+ *
+ * OpenCode ships a `question` tool: the model calls it to put a multiple-choice
+ * question to the USER, and then blocks until somebody answers. A companion
+ * dispatch is headless — nobody ever will. Left alone the session simply stops
+ * making progress until the stall watchdog kills it, and the retry hangs the
+ * same way. Seen in the wild as:
+ *
+ *   activity: question
+ *   heartbeat: 52,033 tokens        <- frozen, three beats running
+ *   attempt 1/3: stalled (no token progress for 120s) — retrying …
+ *   activity: question              <- fresh session, asks again, hangs again
+ *
+ * REJECT rather than reply: answering would mean picking one of the model's
+ * options on the user's behalf (imagine "Drop the migration table? [yes/no]"),
+ * a substantive decision this runtime has no standing to make — and
+ * POST /question/:id/reject takes no body, so there is no honest way to attach
+ * "assume and continue" to an answer anyway. A reject surfaces to the model as
+ * an ordinary tool error, which together with HEADLESS_HEADER in the task
+ * prompt tells it to assume, state the assumption, and carry on.
+ *
+ * Exported for tests. Servers too old to expose /question just 404 the poll,
+ * which fails the res.ok check and makes this a no-op.
+ *
+ * @param {string} baseUrl
+ * @param {Record<string,string>} headers
+ * @param {string} sessionId
+ * @returns {{ stop: () => void }}
+ */
+export function watchAndRejectQuestions(baseUrl, headers, sessionId) {
+  let stopped = false;
+  const handled = new Set();
+
+  (async () => {
+    while (!stopped) {
+      try {
+        const res = await fetch(`${baseUrl}/question`, {
+          headers,
+          signal: AbortSignal.timeout(5000),
+        });
+        if (res.ok) {
+          const raw = await res.json();
+          const pending = Array.isArray(raw) ? raw : (raw?.questions ?? []);
+          for (const q of pending) {
+            if (q.sessionID !== sessionId || handled.has(q.id)) continue;
+            // Each request carries a list of questions; the first one's short
+            // header is the most useful thing to name in the log.
+            const asked = Array.isArray(q.questions) ? q.questions[0] : null;
+            const label = asked?.header || asked?.question || "";
+            try {
+              const reply = await fetch(`${baseUrl}/question/${q.id}/reject`, {
+                method: "POST",
+                headers,
+                signal: AbortSignal.timeout(5000),
+              });
+              // Mark handled only once the reject lands (or terminally 4xx =
+              // already resolved / unknown id). A transient 5xx or network blip
+              // leaves it pending so the next poll retries instead of stranding
+              // the session in the exact hang this watcher exists to prevent.
+              if (reply.ok || (reply.status >= 400 && reply.status < 500)) {
+                handled.add(q.id);
+                process.stderr.write(
+                  `[opencode-companion] auto-rejected a 'question' tool call — headless dispatch, nobody can answer it` +
+                    `${label ? ` (asked: ${label})` : ""}\n`
+                );
+              } else {
+                process.stderr.write(`[opencode-companion] question reject for ${q.id} got HTTP ${reply.status}; will retry\n`);
+              }
+            } catch (err) {
+              process.stderr.write(`[opencode-companion] question reject for ${q.id} failed (${err.message}); will retry\n`);
+            }
+          }
+        }
+      } catch {
+        // Transient poll failure — try again next tick.
+      }
+      await new Promise((r) => setTimeout(r, QUESTION_POLL_INTERVAL_MS));
+    }
+  })();
+
+  return { stop: () => { stopped = true; } };
+}
+
 /**
  * Create an API client bound to a running OpenCode server.
  * @param {string} baseUrl
@@ -519,7 +605,11 @@ export function createClient(baseUrl, opts = {}) {
       if (opts.model) body.model = parseModelRef(opts.model);
       if (opts.system) body.system = opts.system;
 
+      // Two things can silently park a headless turn forever: a permission
+      // prompt, and a `question` tool call. Neither has anyone to answer it, so
+      // both are auto-rejected for the life of this prompt.
       const permissionWatcher = watchAndRejectPermissions(baseUrl, headers, sessionId);
+      const questionWatcher = watchAndRejectQuestions(baseUrl, headers, sessionId);
       let status, responseText;
       try {
         // node:http, not fetch — see httpPostJson / undici bodyTimeout note above.
@@ -530,6 +620,7 @@ export function createClient(baseUrl, opts = {}) {
         ));
       } finally {
         permissionWatcher.stop();
+        questionWatcher.stop();
       }
 
       if (status < 200 || status >= 300) {
@@ -721,6 +812,17 @@ export function extractActivityLines(messages, opts = {}) {
 const _delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Appended to a stall's log line and error when the LAST tool the model ran was
+ * `question` — i.e. it stopped because it is waiting for a human who does not
+ * exist. Without this the user just sees "stalled", which explains nothing and
+ * suggests nothing.
+ */
+const QUESTION_STALL_HINT =
+  " — the model's last action was a `question` tool call: it is waiting for a human to answer, " +
+  "but this is an unattended dispatch and nobody can. Spell the task out more explicitly " +
+  "(state the constraints, and the choices it should assume) so it has nothing to ask about.";
+
+/**
  * Dispatch a prompt to OpenCode with automatic retries — but only for the
  * failure modes that are actually TRANSIENT:
  *
@@ -768,6 +870,11 @@ export async function dispatchWithRetry(opts) {
     let lastTotal = -1;
     let lastProgressAt = Date.now();
     let stalled = false;
+    // Whether the most recent tool the model ran was `question`. A stall in that
+    // state is not a generic hang — it is the model waiting on a human — and is
+    // reported as such. (formatToolActivity renders a question part as the bare
+    // line "question": it carries no input field worth showing.)
+    let lastToolWasQuestion = false;
     // Per-attempt cursor for the internal activity stream: `seen` de-dupes tool
     // parts across beats; `activitySince` drops a resumed session's old commands.
     const activitySeen = new Set();
@@ -776,13 +883,17 @@ export async function dispatchWithRetry(opts) {
       // Surface OpenCode's internal tool calls (bash/edit/read …) so status can
       // show what it is actually running, not just a token count. Logged BEFORE
       // the heartbeat so the heartbeat stays the freshest line (age/token parse).
-      // Best-effort + guarded: an older client without getSessionActivity (or a
-      // fetch failure) simply logs no activity.
-      if (log && typeof client.getSessionActivity === "function") {
+      // Polled even without a `log` sink, because the stall classifier below
+      // reads it. Best-effort + guarded: an older client without
+      // getSessionActivity (or a fetch failure) simply yields no activity.
+      if (typeof client.getSessionActivity === "function") {
         const acts = await client
           .getSessionActivity(sessionId, { since: activitySince, seen: activitySeen, timeoutMs: 8_000 })
           .catch(() => []);
-        for (const a of acts) log(`activity: ${a}`);
+        for (const a of acts) {
+          lastToolWasQuestion = /^question\b/i.test(a);
+          if (log) log(`activity: ${a}`);
+        }
       }
       const u = await client.getSessionUsage(sessionId, { timeoutMs: 8_000 }).catch(() => null);
       const total = u?.total ?? 0;
@@ -814,10 +925,13 @@ export async function dispatchWithRetry(opts) {
     // priority over both the thrown error and an empty body, since an abort can
     // surface as either.
     if (stalled) {
-      lastErr = new Error(stallReason);
-      if (log) log(`attempt ${attempt}/${maxAttempts}: stalled (${stallReason})${retrying ? " — retrying with a fresh session" : ""}`);
+      // A stall right after a `question` call has a specific, actionable cause;
+      // say so instead of leaving the user with a bare "stalled".
+      const hint = lastToolWasQuestion ? QUESTION_STALL_HINT : "";
+      lastErr = new Error(stallReason + hint);
+      if (log) log(`attempt ${attempt}/${maxAttempts}: stalled (${stallReason})${hint}${retrying ? " — retrying with a fresh session" : ""}`);
       if (retrying) { await _delay(backoffMs * attempt); continue; }
-      throw new Error(`Stalled (no token progress) on every one of ${maxAttempts} attempts.`);
+      throw new Error(`Stalled (no token progress) on every one of ${maxAttempts} attempts.${hint}`);
     }
 
     // (2) TRANSPORT error (a non-stall throw) — retryable transient.

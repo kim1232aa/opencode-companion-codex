@@ -27,3 +27,20 @@ fresh one), do this in two steps:
   the SAME session continued — long resumed sessions carry stale context.
 - The `opencodeSessionId` is also printed at the end of every `oc_delegate`
   result, so a resume can use that directly when you already have it.
+
+## Resume vs fresh: decide, do not block
+
+**Never stall waiting for the user to choose.** There is no question tool in a
+delegation context, and a dispatch that waits for an answer nobody gives just
+hangs until the watchdog kills it. Decide deterministically:
+
+- The user's words are clearly a follow-up ("continue", "keep going", "resume",
+  "apply the top fix", "dig deeper") → resume: pass `resumeSession`.
+- Anything else → **start fresh. Fresh is the default.**
+- If a question tool genuinely IS available in the current context, you may ask
+  once instead — but never wait on one that is not there.
+
+When a resumable session existed and you started fresh anyway, say so in one
+line with the result, so the user can override:
+
+`Detected a resumable OpenCode session <id>; started a new session. To continue that session instead, ask to resume (or pass resumeSession explicitly).`

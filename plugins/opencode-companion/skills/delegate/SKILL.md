@@ -40,14 +40,43 @@ trample each other.
   - If you pass a modelID without its provider prefix and it is unambiguous, the
     tool auto-adds the prefix and the result's `Model:` line shows what actually
     ran; if it is ambiguous or unknown, the tool returns concrete suggestions.
-    Run `oc_setup` to list the real provider IDs.
+  - **To list the real provider/model IDs, run `oc_setup` — or `opencode models`.
+    Those are the only two supported ways.** Never read
+    `~/.local/share/opencode/auth.json` or any other credential/token file to
+    enumerate providers: it holds plaintext tokens, reading it is blocked by the
+    permission layer (correctly), and it is never necessary.
 - **Concurrent-edit safety**: for a write task in a repo someone may be editing
   concurrently, set `worktree: true` — OpenCode works in an isolated git
   worktree and the changes are applied back at the end.
 - **Follow-ups**: prefer a fresh delegation with a bounded handoff (objective,
   current findings, constraints, acceptance checks) over resuming. Pass
   `resumeSession` only when the user explicitly wants the same OpenCode
-  session continued; its id is printed at the end of every result.
+  session continued; its id is printed at the end of every result. If a
+  resumable session exists but the user did not clearly ask to continue,
+  **start fresh** (the default) and say so in one line — never stall waiting
+  for a choice nobody is there to make.
+- **The delegated run is UNATTENDED — never let OpenCode ask a question.**
+  Nobody is on the other end of a delegation: if the model stops to ask for
+  clarification, the run hangs until the watchdog kills it, the retry hangs the
+  same way, and the spend is wasted. A question mid-run is a *prompt bug*.
+  - Never write task text that invites one ("let me know if…", "confirm before
+    proceeding", "ask me which approach you prefer").
+  - When the request has any ambiguity, append this to the task text:
+
+    ```
+    This is a non-interactive, unattended run. Nobody can answer a question.
+    Do not ask for clarification or confirmation — there is no one to reply.
+    Default to the most reasonable low-risk interpretation and keep going.
+    If a detail is genuinely undecidable, pick the safest option, proceed, and
+    record the assumption in your final answer under "Assumptions".
+    Resolve the task fully before stopping. Do not stop at the first plausible
+    answer, and do not stop after identifying the issue without applying the fix.
+    ```
+
+  - Most questions come from missing context — a task text that fully specifies
+    paths, constraints, and the end state does not produce one. Ask for an
+    "Assumptions" / "Open questions" section in the *output* instead of a
+    mid-run question.
 
 ## If the call is interrupted
 
