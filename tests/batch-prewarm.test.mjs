@@ -60,4 +60,25 @@ describe("handleDelegateBatch — cold-start pre-warm", () => {
     assert.equal(delegateCalls, 2, "a failed pre-warm must not abort the batch");
     assert.match(res.content[0].text, /2\/2 succeeded/);
   });
+
+  it("registers every sub-delegation under the batch's requestId (so a cancel aborts them all)", async () => {
+    // Each sub-delegation must receive the BATCH tools/call's requestId, so it
+    // registers in `inflight` there and a notifications/cancelled of the batch
+    // aborts every live sub-session — not just one.
+    const seen = [];
+    const deps = {
+      ensureServer: async () => ({ url: "http://x", alreadyRunning: true }),
+      handleDelegate: async (_args, reqId) => { seen.push(reqId); return ok(); },
+    };
+    await handleDelegateBatch(
+      { tasks: [{ task: "a" }, { task: "b" }, { task: "c" }], workspace: os.tmpdir() },
+      "req-batch-1",
+      deps
+    );
+    assert.equal(seen.length, 3);
+    assert.ok(
+      seen.every((r) => r === "req-batch-1"),
+      `every sub must share the batch requestId; got ${JSON.stringify(seen)}`
+    );
+  });
 });

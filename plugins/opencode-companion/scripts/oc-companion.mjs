@@ -37,7 +37,7 @@ import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
-const SERVER_VERSION = "0.4.2";
+const SERVER_VERSION = "0.4.3";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // Plugin root — the directory that holds prompts/ and schemas/. Reviews read
@@ -99,8 +99,26 @@ export function buildResultTrailer(usage, { requestedModel, sessionId, jobId } =
   return idBits.length ? `\n✓ ${idBits.join(" · ")}` : "";
 }
 
-// requestId → { sessionId, jobId, workspace } for notifications/cancelled.
+// requestId → ARRAY of { sessionId, jobId, workspace } for notifications/cancelled.
+// It's an array (not a single entry) so a batch, whose sub-delegations all share
+// the batch tools/call's requestId, can have EVERY sub-session aborted on cancel
+// — not just one. A retry of the same job replaces that job's entry (fresh
+// session); each job removes its own entry when it finishes.
 const inflight = new Map();
+function inflightAdd(requestId, entry) {
+  if (requestId === undefined) return;
+  const list = (inflight.get(requestId) ?? []).filter((e) => e.jobId !== entry.jobId);
+  list.push(entry);
+  inflight.set(requestId, list);
+}
+function inflightRemove(requestId, jobId) {
+  if (requestId === undefined) return;
+  const list = inflight.get(requestId);
+  if (!list) return;
+  const next = list.filter((e) => e.jobId !== jobId);
+  if (next.length) inflight.set(requestId, next);
+  else inflight.delete(requestId);
+}
 
 // ─── Output budget ──────────────────────────────────────────────────────────
 
@@ -353,7 +371,7 @@ async function handleDelegate(args, requestId) {
           makeSession: () => client.createSession({ title: `Codex delegate ${job.id}` }),
           onSession: (sid) => {
             upsertJob(workspace, { id: job.id, opencodeSessionId: sid });
-            if (requestId !== undefined) inflight.set(requestId, { sessionId: sid, jobId: job.id, workspace });
+            inflightAdd(requestId, { sessionId: sid, jobId: job.id, workspace });
           },
           shouldStop: () => isJobCanceled(workspace, job.id),
         });
@@ -397,7 +415,7 @@ async function handleDelegate(args, requestId) {
   } catch (err) {
     return errText(`Delegation failed (job ${job.id}): ${err.message}. If OpenCode kept running server-side, oc_result may still recover the answer.`);
   } finally {
-    if (requestId !== undefined) inflight.delete(requestId);
+    inflightRemove(requestId, job.id);
   }
 }
 
@@ -443,7 +461,10 @@ export async function handleDelegateBatch(args, requestId, deps = {}) {
           task: t.task, model: t.model, agent: t.agent, worktree: t.worktree,
           brief: t.brief, maxWords: t.maxWords, workspace,
         },
-        undefined // batch-level cancellation is handled via oc_cancel per job
+        // Every sub-delegation registers under the BATCH's requestId, so a
+        // notifications/cancelled of the batch tools/call aborts every live
+        // sub-session — not just one. (oc_cancel per job still works too.)
+        requestId
       ).then((r) => ({
         label: typeof t.label === "string" && t.label.trim() ? t.label.trim() : `task ${i + 1}`,
         isError: r.isError === true,
@@ -643,7 +664,7 @@ async function runReview(args, requestId, { adversarial }) {
         makeSession: () => client.createSession({ title: `${label} ${job.id}` }),
         onSession: (sid) => {
           upsertJob(workspace, { id: job.id, opencodeSessionId: sid });
-          if (requestId !== undefined) inflight.set(requestId, { sessionId: sid, jobId: job.id, workspace });
+          inflightAdd(requestId, { sessionId: sid, jobId: job.id, workspace });
         },
         shouldStop: () => isJobCanceled(workspace, job.id),
       });
@@ -680,7 +701,7 @@ async function runReview(args, requestId, { adversarial }) {
   } catch (err) {
     return errText(`${label} failed (job ${job.id}): ${err.message}. If OpenCode kept running server-side, oc_result may still recover the answer.`);
   } finally {
-    if (requestId !== undefined) inflight.delete(requestId);
+    inflightRemove(requestId, job.id);
   }
 }
 
@@ -795,25 +816,29 @@ async function handleMessage(msg) {
     // Cancel the in-flight delegation tied to this request: abort its OpenCode
     // session so sendPrompt returns; the job is finalized by its own error path.
     const reqId = msg.params?.requestId;
-    const entry = inflight.get(reqId);
-    if (entry) {
+    const entries = inflight.get(reqId);
+    if (entries && entries.length) {
       inflight.delete(reqId);
-      // Mark the job canceled BEFORE aborting so an in-flight dispatch that is
-      // mid-retry sees the cancel via its shouldStop check and does not re-run
-      // the task on a fresh session. CAS-style: never clobber a terminal status.
-      updateState(entry.workspace, (state) => {
-        const j = state.jobs?.find((x) => x.id === entry.jobId);
-        if (j && (j.status === "running" || j.status === "pending")) {
-          j.status = "canceled";
-          j.completedAt = new Date().toISOString();
-          j.errorMessage = "Canceled by user";
-          j.updatedAt = new Date().toISOString();
-        }
-      });
-      try {
-        const client = createClient(defaultServerUrl(), { directory: entry.workspace });
-        await client.abortSession(entry.sessionId);
-      } catch { /* best-effort */ }
+      // One entry for a single delegation; MANY for a batch (all its sub-sessions
+      // share the batch requestId). Abort EVERY one. For each: mark the job
+      // canceled BEFORE aborting so an in-flight dispatch mid-retry sees the
+      // cancel via shouldStop and does not re-run on a fresh session. CAS-style:
+      // never clobber a terminal status.
+      for (const entry of entries) {
+        updateState(entry.workspace, (state) => {
+          const j = state.jobs?.find((x) => x.id === entry.jobId);
+          if (j && (j.status === "running" || j.status === "pending")) {
+            j.status = "canceled";
+            j.completedAt = new Date().toISOString();
+            j.errorMessage = "Canceled by user";
+            j.updatedAt = new Date().toISOString();
+          }
+        });
+        try {
+          const client = createClient(defaultServerUrl(), { directory: entry.workspace });
+          await client.abortSession(entry.sessionId);
+        } catch { /* best-effort */ }
+      }
     }
     return;
   }
