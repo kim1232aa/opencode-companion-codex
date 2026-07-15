@@ -18,7 +18,11 @@ import { getDiff, getStatus, getChangedFiles } from "./git.mjs";
  */
 export async function buildReviewPrompt(cwd, opts, pluginRoot) {
   const diff = await getDiff(cwd, { base: opts.base });
-  const status = await getStatus(cwd);
+  // Working-tree status is only relevant to a working-tree review. For a
+  // --base branch review the diff and changed-files are already scoped to
+  // base...HEAD; injecting the current `git status` would drag in unrelated
+  // uncommitted/untracked files and invite out-of-scope findings.
+  const status = opts.base ? "" : await getStatus(cwd);
   const changedFiles = await getChangedFiles(cwd, { base: opts.base });
 
   let systemPrompt;
@@ -311,7 +315,7 @@ export function buildTaskPrompt(taskText, opts = {}) {
   }
 
   if (opts.write) {
-    parts.push("You have full read/write access. Make the necessary code changes.");
+    parts.push("You have full read/write access. Make the necessary code changes. Leave your edits in the working tree — do NOT run `git commit`; the caller captures and applies your changes itself, and committing inside an isolated worktree can bury them.");
   } else {
     parts.push("This is a read-only investigation. Do not modify any files.");
   }

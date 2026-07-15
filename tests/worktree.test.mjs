@@ -111,4 +111,50 @@ describe("withWorktree", { skip: !hasGit }, () => {
       fs.rmSync(plain, { recursive: true, force: true });
     }
   });
+
+  it("captures a commit made inside the worktree and applies it back", async () => {
+    // Regression: writeback diffed against the literal "HEAD" ref, so if the
+    // agent ran `git commit`, HEAD moved to that commit and the diff came back
+    // EMPTY — the committed work was silently dropped when the worktree was
+    // removed. The diff is now pinned to the base SHA captured at creation.
+    const logs = [];
+    const result = await withWorktree(
+      { dir: repo, jobId: "job-commit", useWorktree: true, isWrite: true },
+      async (cwd) => {
+        fs.writeFileSync(path.join(cwd, "committed.txt"), "from a commit\n");
+        git(cwd, ["add", "-A"]);
+        git(cwd, ["commit", "-qm", "agent commit inside worktree"]);
+        return "ok";
+      },
+      (m) => logs.push(m)
+    );
+    assert.equal(result, "ok");
+    // The committed file must land in the live repo working tree.
+    assert.equal(fs.readFileSync(path.join(repo, "committed.txt"), "utf8"), "from a commit\n");
+    assert.ok(logs.some((l) => /applied/i.test(l)), logs.join(" | "));
+    assert.ok(!fs.existsSync(path.join(repo, ".opencode-worktrees")));
+  });
+
+  it("throws instead of reporting success when changes cannot be applied back", async () => {
+    // Regression: an apply conflict (or an oversized patch) used to be logged and
+    // then `return result` — reporting the task COMPLETE while its changes sat
+    // stranded in the worktree. It now throws so the job fails honestly, and the
+    // worktree is preserved for recovery.
+    const wtRoot = path.join(repo, ".opencode-worktrees", "job-conflict");
+    await assert.rejects(
+      withWorktree(
+        { dir: repo, jobId: "job-conflict", useWorktree: true, isWrite: true },
+        async (cwd) => {
+          fs.writeFileSync(path.join(cwd, "conflict.txt"), "worktree content\n");
+          // The SAME new file already exists in the live repo with different
+          // content, so the "add file" patch cannot apply back cleanly.
+          fs.writeFileSync(path.join(repo, "conflict.txt"), "pre-existing live content\n");
+          return "ok";
+        }
+      ),
+      /could NOT be applied back|conflict/i
+    );
+    // The worktree is preserved so the stranded work can be recovered.
+    assert.ok(fs.existsSync(wtRoot), "worktree must be kept for recovery on a failed writeback");
+  });
 });

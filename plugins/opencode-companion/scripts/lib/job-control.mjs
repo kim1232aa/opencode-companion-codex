@@ -1,6 +1,6 @@
 // Job control: query, sort, enrich, and build status snapshots.
 
-import { tailLines, pidStartTime, writeJson } from "./fs.mjs";
+import { tailLines, pidStartTime, writeJson, appendLine } from "./fs.mjs";
 import { jobLogPath, jobDataPath, upsertJob, loadState } from "./state.mjs";
 import { createClient, isServerRunning } from "./opencode-server.mjs";
 
@@ -148,8 +148,16 @@ export async function recoverStrandedResults(workspacePath, jobs, serverUrl) {
         since,
         timeoutMs: RECOVERY_PROBE_TIMEOUT_MS,
       });
-    } catch {
+    } catch (err) {
+      // Keep the reason. A probe throw (server unreachable / timeout / auth)
+      // leaves the job unrecovered, and it later reconciles to `failed` — but
+      // without this the operator can't tell "the server had no answer" from
+      // "we couldn't reach the server to ask". Best-effort log; logging must
+      // never break recovery itself.
       probe = { text: null, active: false };
+      try {
+        appendLine(jobLogPath(workspacePath, j.id), `[${new Date().toISOString()}] recovery probe failed: ${err.message}`);
+      } catch { /* logging is best-effort */ }
     }
     if (probe.text) {
       const usage = await client

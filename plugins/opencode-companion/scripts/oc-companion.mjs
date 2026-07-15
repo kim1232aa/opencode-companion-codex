@@ -30,24 +30,27 @@ import {
   recoverStrandedResults,
   isOwnedProcessAlive,
 } from "./lib/job-control.mjs";
-import { createJobRecord, runTrackedJob, getClaudeSessionId, isJobCanceled } from "./lib/tracked-jobs.mjs";
+import { createJobRecord, runTrackedJob, getClaudeSessionId, isJobCanceled, taskPreview } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, formatUsage, formatTrailer } from "./lib/render.mjs";
 import { buildTaskPrompt, buildReviewPrompt } from "./lib/prompts.mjs";
 import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
-const SERVER_VERSION = "0.4.4";
+const SERVER_VERSION = "0.4.5";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // Plugin root — the directory that holds prompts/ and schemas/. Reviews read
 // their prompt templates from here. The stdio server lives at
 // <root>/scripts/oc-companion.mjs, so the root is the parent of this file's dir.
 // An explicit env override wins so a relocated launch can still find templates.
+// fileURLToPath(import.meta.url), not import.meta.dirname (Node 20.11+): engines
+// declares >=18.18, and on 18/19 import.meta.dirname is undefined → path.resolve
+// throws at startup when neither env override is set.
 const PLUGIN_ROOT =
   process.env.OPENCODE_COMPANION_PLUGIN_ROOT ||
   process.env.CLAUDE_PLUGIN_ROOT ||
-  path.resolve(import.meta.dirname, "..");
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function defaultServerUrl() {
   const port = Number(process.env.OPENCODE_SERVER_PORT) || 4096;
@@ -118,6 +121,59 @@ function inflightRemove(requestId, jobId) {
   const next = list.filter((e) => e.jobId !== jobId);
   if (next.length) inflight.set(requestId, next);
   else inflight.delete(requestId);
+}
+
+// Requests that have already received a notifications/cancelled. A batch's
+// sub-delegations all share the batch requestId; one whose OpenCode session is
+// created AFTER the cancel arrived would miss the handler's one-shot inflight
+// snapshot and run to completion. registerSession/shouldStop consult this so a
+// late session self-cancels instead. The cancel handler records the id in its
+// SYNCHRONOUS prologue (before it snapshots and before its first await), so —
+// single-threaded — a sub is guaranteed to be either in that snapshot or to see
+// this flag when its own onSession runs. No gap.
+const canceledRequests = new Set();
+export function isRequestCanceled(requestId) {
+  return requestId !== undefined && canceledRequests.has(requestId);
+}
+export function noteRequestCanceled(requestId) {
+  if (requestId === undefined) return;
+  canceledRequests.add(requestId);
+  // Bound memory on a long-lived server: drop the oldest id past a soft cap.
+  if (canceledRequests.size > 512) canceledRequests.delete(canceledRequests.values().next().value);
+}
+
+// Compare-and-set a job to canceled, never clobbering an already-terminal status.
+function markJobCanceled(workspace, jobId) {
+  updateState(workspace, (state) => {
+    const j = state.jobs?.find((x) => x.id === jobId);
+    if (j && (j.status === "running" || j.status === "pending")) {
+      j.status = "canceled";
+      j.completedAt = new Date().toISOString();
+      j.errorMessage = "Canceled by user";
+      j.updatedAt = new Date().toISOString();
+    }
+  });
+}
+
+// Abort an OpenCode session, time-bounded so a hung server can't wedge the caller
+// for request()'s full 300s budget.
+async function abortSessionBounded(workspace, sessionId) {
+  try {
+    const client = createClient(defaultServerUrl(), { directory: workspace });
+    await withTimeout(Promise.resolve().then(() => client.abortSession(sessionId)), ABORT_TIMEOUT_MS);
+  } catch { /* best-effort: timed out or server down */ }
+}
+
+// Register a freshly-created OpenCode session for cancellation. If a cancel for
+// this request already arrived while the session was being created, abort it
+// right away instead of letting it run to completion (see canceledRequests).
+export function registerSession(requestId, workspace, jobId, sid) {
+  upsertJob(workspace, { id: jobId, opencodeSessionId: sid });
+  inflightAdd(requestId, { sessionId: sid, jobId, workspace });
+  if (isRequestCanceled(requestId)) {
+    markJobCanceled(workspace, jobId);
+    abortSessionBounded(workspace, sid); // best-effort; shouldStop also bails the retry loop
+  }
 }
 
 // ─── Output budget ──────────────────────────────────────────────────────────
@@ -321,7 +377,19 @@ async function handleDelegate(args, requestId) {
     ? args.resumeSession.trim()
     : null;
 
-  const job = createJobRecord(workspace, "task", { agent: agentName, resumeSessionId });
+  // Record the routing metadata so status/watch/result show WHICH model and WHAT
+  // task (CC's task path stores the same). Use taskPreview directly rather than
+  // taskText: passing taskText would make createJobRecord write a `.request.json`
+  // dispatch file, but Codex delegations run in-process — nothing ever reads that
+  // file back (no detached worker), so it would only be dead clutter.
+  const job = createJobRecord(workspace, "task", {
+    agent: agentName,
+    resumeSessionId,
+    model: args.model,
+    write: isWrite,
+    worktree: useWorktree,
+    taskPreview: taskPreview(task),
+  });
 
   try {
     const result = await runTrackedJob(workspace, job, async ({ report, log }) =>
@@ -369,11 +437,8 @@ async function handleDelegate(args, requestId) {
           log,
           resumeSessionId,
           makeSession: () => client.createSession({ title: `Codex delegate ${job.id}` }),
-          onSession: (sid) => {
-            upsertJob(workspace, { id: job.id, opencodeSessionId: sid });
-            inflightAdd(requestId, { sessionId: sid, jobId: job.id, workspace });
-          },
-          shouldStop: () => isJobCanceled(workspace, job.id),
+          onSession: (sid) => registerSession(requestId, workspace, job.id, sid),
+          shouldStop: () => isJobCanceled(workspace, job.id) || isRequestCanceled(requestId),
         });
         const response = dispatch.response;
         const sessionId = dispatch.sessionId;
@@ -518,7 +583,23 @@ async function handleResult(args) {
   return text(renderResult(enriched, resultData));
 }
 
-export async function handleCancel(args) {
+// Bound a best-effort abort so a hung (accept-but-never-answer) server can't
+// wedge cancel for request()'s full 300s budget. Mirrors the Claude Code
+// frontend, which wraps abortSession in a 4s timeout before moving on.
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+const ABORT_TIMEOUT_MS = 4000;
+
+export async function handleCancel(args, _requestId, deps = {}) {
+  const makeClient = deps.createClient ?? createClient;
+  const abortMs = deps.abortTimeoutMs ?? ABORT_TIMEOUT_MS;
   const workspace = await resolveWorkspaceArg(args);
   const ref = typeof args.job === "string" && args.job.trim() ? args.job.trim() : undefined;
   if (ref && !/^[A-Za-z0-9._:-]+$/.test(ref)) {
@@ -536,16 +617,20 @@ export async function handleCancel(args) {
   if (ambiguous) return errText("Error: multiple running jobs — give a job id prefix.");
   if (!targets.length) return text("No active job to cancel.");
 
-  const client = createClient(defaultServerUrl(), { directory: workspace });
+  const client = makeClient(defaultServerUrl(), { directory: workspace });
   const canceled = [];
   const alreadyDone = [];
 
   for (const job of targets) {
     // Abort the OpenCode session if we have one (returns its blocked sendPrompt).
     if (job.opencodeSessionId) {
-      try {
-        await client.abortSession(job.opencodeSessionId);
-      } catch { /* server may be down */ }
+      // Time-bounded: a hung server must not stall oc_cancel — the job is
+      // CAS-canceled below regardless, and an in-process delegation has no
+      // worker to fall through to (its sendPrompt unwinds on its own timeout).
+      await withTimeout(
+        Promise.resolve().then(() => client.abortSession(job.opencodeSessionId)),
+        abortMs,
+      ).catch(() => { /* server down / slow */ });
     }
     // A detached worker only exists for jobs created by the sibling Claude Code
     // frontend sharing this store; in-process delegations have none. Ownership is
@@ -556,7 +641,8 @@ export async function handleCancel(args) {
       // instead of left burning tokens. Only reachable when both frontends share
       // a store via OPENCODE_COMPANION_DATA — Codex never spawns its own detached
       // worker — but then a single unescalated SIGTERM was the weaker path.
-      await terminateGroup(job.pid, { isAlive: (p) => isOwnedProcessAlive(p, job.pidStart) });
+      await terminateGroup(job.pid, { isAlive: (p) => isOwnedProcessAlive(p, job.pidStart) })
+        .catch(() => { /* terminateGroup already swallows signal errors; catch for parity with the CC path */ });
     }
     // Compare-and-set INSIDE the state lock: the worker may reach a terminal
     // status during the abort round-trip, and a check-then-write outside the lock
@@ -667,11 +753,8 @@ async function runReview(args, requestId, { adversarial }) {
         extract: extractResponseText,
         log,
         makeSession: () => client.createSession({ title: `${label} ${job.id}` }),
-        onSession: (sid) => {
-          upsertJob(workspace, { id: job.id, opencodeSessionId: sid });
-          inflightAdd(requestId, { sessionId: sid, jobId: job.id, workspace });
-        },
-        shouldStop: () => isJobCanceled(workspace, job.id),
+        onSession: (sid) => registerSession(requestId, workspace, job.id, sid),
+        shouldStop: () => isJobCanceled(workspace, job.id) || isRequestCanceled(requestId),
       });
       const response = dispatch.response;
       const sessionId = dispatch.sessionId;
@@ -818,31 +901,22 @@ export function pickResumeCandidate(jobs, sessionId) {
 async function handleMessage(msg) {
   if (msg.method === "notifications/initialized") return;
   if (msg.method === "notifications/cancelled") {
-    // Cancel the in-flight delegation tied to this request: abort its OpenCode
-    // session so sendPrompt returns; the job is finalized by its own error path.
+    // Cancel the in-flight delegation(s) tied to this request: mark the job
+    // canceled (so an in-flight dispatch sees it via shouldStop and does not
+    // re-run on a fresh session) and abort its OpenCode session so sendPrompt
+    // returns. One entry for a single delegation; MANY for a batch (all its
+    // sub-sessions share the batch requestId) — abort EVERY one.
     const reqId = msg.params?.requestId;
+    // Record the cancel BEFORE snapshotting inflight: a sub-delegation whose
+    // session registers after this point then self-cancels in registerSession
+    // instead of slipping past this one-shot snapshot and running to completion.
+    noteRequestCanceled(reqId);
     const entries = inflight.get(reqId);
     if (entries && entries.length) {
       inflight.delete(reqId);
-      // One entry for a single delegation; MANY for a batch (all its sub-sessions
-      // share the batch requestId). Abort EVERY one. For each: mark the job
-      // canceled BEFORE aborting so an in-flight dispatch mid-retry sees the
-      // cancel via shouldStop and does not re-run on a fresh session. CAS-style:
-      // never clobber a terminal status.
       for (const entry of entries) {
-        updateState(entry.workspace, (state) => {
-          const j = state.jobs?.find((x) => x.id === entry.jobId);
-          if (j && (j.status === "running" || j.status === "pending")) {
-            j.status = "canceled";
-            j.completedAt = new Date().toISOString();
-            j.errorMessage = "Canceled by user";
-            j.updatedAt = new Date().toISOString();
-          }
-        });
-        try {
-          const client = createClient(defaultServerUrl(), { directory: entry.workspace });
-          await client.abortSession(entry.sessionId);
-        } catch { /* best-effort */ }
+        markJobCanceled(entry.workspace, entry.jobId);
+        await abortSessionBounded(entry.workspace, entry.sessionId);
       }
     }
     return;

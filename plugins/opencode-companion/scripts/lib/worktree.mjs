@@ -61,6 +61,15 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
     throw new Error(`--worktree setup failed: ${add.stderr.trim() || "git worktree add failed"}. Not falling back to the live workspace (isolation was explicitly requested).`);
   }
 
+  // The worktree starts detached at the repo's current HEAD. Pin that SHA now: if
+  // the agent runs `git commit` inside the worktree, HEAD moves forward, and
+  // capturing the changes with a diff against the LITERAL "HEAD" ref would then
+  // compare against the agent's OWN commit — yielding an empty patch and silently
+  // dropping the committed work when the worktree is removed. Diff against the
+  // pinned base instead, so committed + staged + unstaged changes are all caught.
+  const rp = await git(top, ["rev-parse", "HEAD"]).catch(() => null);
+  const baseRef = rp && rp.exitCode === 0 && rp.stdout.trim() ? rp.stdout.trim() : "HEAD";
+
   // If `dir` was a subdirectory of the repo, run the task in the matching
   // subdirectory INSIDE the worktree — not the worktree root — so OpenCode's
   // cwd and visible file scope match what the caller asked for.
@@ -93,7 +102,7 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
       throw new Error(`git add -A failed in worktree (${added.stderr.trim() || "unknown error"}); changes preserved at ${wtPath}.`);
     }
     const MAX_PATCH = 128 * 1024 * 1024;
-    const diff = await git(wtPath, ["diff", "--cached", "--binary", "HEAD"], { maxOutputBytes: MAX_PATCH });
+    const diff = await git(wtPath, ["diff", "--cached", "--binary", baseRef], { maxOutputBytes: MAX_PATCH });
     if (diff.exitCode !== 0) {
       keepWorktree = true;
       throw new Error(`git diff failed in worktree (${diff.stderr.trim() || "unknown error"}); changes preserved at ${wtPath}.`);
@@ -103,8 +112,11 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
     // A truncated diff would corrupt the patch and apply garbage — refuse it.
     if (diff.overflowed) {
       keepWorktree = true;
-      log(`Worktree changes exceed ${Math.round(MAX_PATCH / (1024 * 1024))}MB and were NOT applied back automatically. Recover them from ${wtPath}.`);
-      return result;
+      // The task ran, but its changes could NOT be applied back. Returning
+      // `result` here would report the delegation COMPLETE while the changes sit
+      // stranded in the worktree — a false success. Fail honestly and point at
+      // where the work is (oc_result can still recover the model's answer text).
+      throw new Error(`Task changes exceed ${Math.round(MAX_PATCH / (1024 * 1024))}MB and were NOT applied back to the workspace. Recover them from the preserved worktree at ${wtPath}.`);
     }
 
     if (patch.trim()) {
@@ -116,8 +128,10 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
         .catch((e) => ({ exitCode: 1, stderr: e.message, stdout: "" }));
       if (apply.exitCode !== 0) {
         keepWorktree = true;
-        log(`Worktree changes could NOT be applied back cleanly (likely a conflict with concurrent edits): ${apply.stderr.trim()}. The patch is preserved at ${patchFile} and the worktree at ${wtPath}.`);
-        return result;
+        // Applying back failed (typically a conflict with concurrent edits).
+        // Don't report the task complete with its changes silently stranded —
+        // fail, and preserve both the patch and the worktree for recovery.
+        throw new Error(`Task changes could NOT be applied back to the workspace (likely a conflict with concurrent edits): ${apply.stderr.trim()}. The patch is preserved at ${patchFile} and the worktree at ${wtPath}.`);
       }
       log("Applied the isolated worktree changes back to the workspace.");
     }

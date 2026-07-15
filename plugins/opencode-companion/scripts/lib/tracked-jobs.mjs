@@ -224,12 +224,19 @@ export async function runTrackedJob(workspacePath, job, runner) {
       finalized = true;
     });
 
-    // Write result data file
-    const dataFile = jobDataPath(workspacePath, job.id);
-    ensureDir(path.dirname(dataFile));
-    fs.writeFileSync(dataFile, JSON.stringify(result, null, 2), { encoding: "utf8", mode: 0o600 });
-
-    if (finalized) report("completed", `Job ${job.id} completed`);
+    // Persist the result data file ONLY when we actually finalized this job as
+    // completed. If a cancel landed during the run (finalized === false because
+    // the CAS above found the status already "canceled"), writing it would leave
+    // a recoverable partial answer that `result` would surface — contradicting
+    // cancel's contract that partial output is not preserved. A failed job (catch
+    // below) writes no data file either, so this keeps terminal-but-not-completed
+    // jobs consistent.
+    if (finalized) {
+      const dataFile = jobDataPath(workspacePath, job.id);
+      ensureDir(path.dirname(dataFile));
+      fs.writeFileSync(dataFile, JSON.stringify(result, null, 2), { encoding: "utf8", mode: 0o600 });
+      report("completed", `Job ${job.id} completed`);
+    }
     return result;
   } catch (err) {
     // CAS: don't clobber a status someone else already finalized — e.g. cancel

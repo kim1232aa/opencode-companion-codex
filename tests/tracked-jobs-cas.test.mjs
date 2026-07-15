@@ -3,13 +3,13 @@
 // normally with partial output) and the error path (sendPrompt throws).
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 process.env.OPENCODE_COMPANION_DATA = mkdtempSync(join(tmpdir(), "oc-cas-"));
 
 const { runTrackedJob, createJobRecord } = await import("../plugins/opencode-companion/scripts/lib/tracked-jobs.mjs");
-const { upsertJob, loadState } = await import("../plugins/opencode-companion/scripts/lib/state.mjs");
+const { upsertJob, loadState, jobDataPath } = await import("../plugins/opencode-companion/scripts/lib/state.mjs");
 
 const ws = mkdtempSync(join(tmpdir(), "oc-cas-ws-"));
 
@@ -24,6 +24,10 @@ describe("runTrackedJob — terminal status is never clobbered", () => {
     });
     const j = loadState(ws).jobs.find((x) => x.id === job.id);
     assert.equal(j.status, "canceled");
+    // And the partial answer must NOT be left on disk — result/oc_result would
+    // otherwise surface it, contradicting cancel's "partial output is not
+    // preserved" contract.
+    assert.equal(existsSync(jobDataPath(ws, job.id)), false, "canceled job must not persist a result data file");
   });
 
   it("error path does not flip canceled → failed", async () => {
@@ -43,5 +47,7 @@ describe("runTrackedJob — terminal status is never clobbered", () => {
     await runTrackedJob(ws, job, async () => ({ rendered: "done", summary: "done" }));
     const j = loadState(ws).jobs.find((x) => x.id === job.id);
     assert.equal(j.status, "completed");
+    // A completed job DOES persist its result so result/oc_result can return it.
+    assert.equal(existsSync(jobDataPath(ws, job.id)), true, "completed job must persist its result data file");
   });
 });
