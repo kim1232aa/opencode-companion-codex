@@ -1,6 +1,6 @@
 {
   "name": "opencode-companion-codex",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Codex plugin: delegate coding tasks to OpenCode on any OpenAI-compatible backend",
   "type": "module",
   "license": "Apache-2.0",

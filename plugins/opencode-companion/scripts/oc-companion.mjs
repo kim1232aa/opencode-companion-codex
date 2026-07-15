@@ -17,7 +17,7 @@ import readline from "node:readline";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { isOpencodeInstalled, getOpencodeVersion } from "./lib/process.mjs";
+import { isOpencodeInstalled, getOpencodeVersion, terminateGroup } from "./lib/process.mjs";
 import { isServerRunning, ensureServer, connect, createClient, suggestModelRefs, dispatchWithRetry } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, jobDataPath } from "./lib/state.mjs";
@@ -37,7 +37,7 @@ import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
-const SERVER_VERSION = "0.4.3";
+const SERVER_VERSION = "0.4.4";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // Plugin root — the directory that holds prompts/ and schemas/. Reviews read
@@ -551,7 +551,12 @@ export async function handleCancel(args) {
     // frontend sharing this store; in-process delegations have none. Ownership is
     // verified via the pid start-time fingerprint so a recycled pid is never hit.
     if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
-      try { process.kill(job.pid, "SIGTERM"); } catch { /* race: gone */ }
+      // Match the Claude Code frontend: escalate SIGTERM→SIGKILL and signal the
+      // worker's whole process group, so one that traps SIGTERM is still stopped
+      // instead of left burning tokens. Only reachable when both frontends share
+      // a store via OPENCODE_COMPANION_DATA — Codex never spawns its own detached
+      // worker — but then a single unescalated SIGTERM was the weaker path.
+      await terminateGroup(job.pid, { isAlive: (p) => isOwnedProcessAlive(p, job.pidStart) });
     }
     // Compare-and-set INSIDE the state lock: the worker may reach a terminal
     // status during the abort round-trip, and a check-then-write outside the lock
