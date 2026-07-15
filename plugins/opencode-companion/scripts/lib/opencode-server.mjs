@@ -268,10 +268,13 @@ function watchAndRejectPermissions(baseUrl, headers, sessionId) {
                 }),
                 signal: AbortSignal.timeout(5000),
               });
-              // Only mark handled once the reject is accepted (or terminally
-              // 4xx = already resolved). A transient 5xx/network failure leaves
-              // it unhandled so the next poll retries instead of stranding it.
-              if (reply.ok || (reply.status >= 400 && reply.status < 500)) {
+              // Mark handled only when the reject is accepted, or the prompt is
+              // GONE (404 = already resolved / no such id, 409 = already
+              // answered). Any OTHER 4xx means OUR reject failed — a 400/401/403
+              // is not "resolved", and marking it handled would falsely claim we
+              // rejected a prompt that is still pending, leaving the session hung
+              // in the exact way this watcher exists to prevent. Log + retry.
+              if (reply.ok || reply.status === 404 || reply.status === 409) {
                 handled.add(p.id);
               } else {
                 process.stderr.write(`[opencode-companion] permission reject for ${p.id} got HTTP ${reply.status}; will retry\n`);
@@ -349,11 +352,13 @@ export function watchAndRejectQuestions(baseUrl, headers, sessionId) {
                 headers,
                 signal: AbortSignal.timeout(5000),
               });
-              // Mark handled only once the reject lands (or terminally 4xx =
-              // already resolved / unknown id). A transient 5xx or network blip
-              // leaves it pending so the next poll retries instead of stranding
-              // the session in the exact hang this watcher exists to prevent.
-              if (reply.ok || (reply.status >= 400 && reply.status < 500)) {
+              // Mark handled only when the reject lands, or the question is GONE
+              // (404 = already resolved / unknown id, 409 = already answered).
+              // Any OTHER 4xx means OUR reject failed — treating a 400/401/403 as
+              // "resolved" would falsely log "auto-rejected" while the question is
+              // still pending, stranding the session in the exact hang this
+              // watcher exists to prevent. Log + retry instead.
+              if (reply.ok || reply.status === 404 || reply.status === 409) {
                 handled.add(q.id);
                 process.stderr.write(
                   `[opencode-companion] auto-rejected a 'question' tool call — headless dispatch, nobody can answer it` +
@@ -567,6 +572,38 @@ export function createClient(baseUrl, opts = {}) {
         return { text: doneText, active };
       } catch {
         return { text: null, active: false };
+      }
+    },
+
+    /**
+     * The error message on the session's MOST RECENT assistant turn, or null.
+     * A turn can come back with empty text because the PROVIDER errored on it
+     * (rate-limit, "credentials cooling down", a 502 gateway/queue drop) rather
+     * than because the model deterministically had nothing to say.
+     * dispatchWithRetry consults this so a transient provider error is retried
+     * and reported honestly, instead of being misread as a deterministic empty
+     * response ("not retried; try another model") — which hid the real cause.
+     * @param {string} sessionId
+     * @param {{ timeoutMs?: number }} [opts]
+     * @returns {Promise<string|null>}
+     */
+    getLastTurnError: async (sessionId, opts = {}) => {
+      const timeoutMs = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : 8_000;
+      try {
+        const msgs = await request("GET", `/session/${sessionId}/message`, undefined, timeoutMs);
+        const list = Array.isArray(msgs) ? msgs : [];
+        for (let i = list.length - 1; i >= 0; i--) {
+          const info = list[i]?.info;
+          if (!info || info.role !== "assistant") continue;
+          const err = info.error;
+          if (err == null) return null; // newest assistant turn finished clean
+          // Dig a human string out of the { name, data: { message } } shape.
+          const msg = err?.data?.message ?? err?.message ?? err?.name;
+          return (typeof msg === "string" ? msg : JSON.stringify(err)).replace(/^"|"$/g, "");
+        }
+        return null;
+      } catch {
+        return null; // can't tell ⇒ caller falls back to the deterministic path
       }
     },
 
@@ -942,9 +979,28 @@ export async function dispatchWithRetry(opts) {
       throw new Error(`Delegation failed after ${maxAttempts} attempts. Last error: ${threw.message}`);
     }
 
-    // (3) EMPTY on a non-stalled turn — deterministic-looking, do NOT retry.
+    // (3) EMPTY on a non-stalled turn. Two very different causes hide here, and
+    // conflating them is a lie to the user:
+    //   (3a) the PROVIDER errored on the final turn (rate-limit, "credentials
+    //        cooling down", a 502 gateway/queue drop). Empty text, but TRANSIENT
+    //        — retry it, and report the real error. Misreporting this as
+    //        "deterministic empty output; try another model" hid a rate-limit
+    //        behind a false "your prompt/model is the problem" message.
+    //   (3b) a genuinely empty turn (the model had nothing to say). Deterministic
+    //        — do NOT retry; retrying only re-burns cached input.
     const outText = (typeof extract === "function" ? extract(response) : "") || "";
     if (!outText.trim()) {
+      // typeof-guarded so an older/mock client without getLastTurnError simply
+      // falls through to the deterministic-empty path (backward compatible).
+      const turnErr = typeof client.getLastTurnError === "function"
+        ? await client.getLastTurnError(sessionId, { timeoutMs: 8_000 }).catch(() => null)
+        : null;
+      if (turnErr) {
+        lastErr = new Error(`OpenCode provider error: ${turnErr}`);
+        if (log) log(`attempt ${attempt}/${maxAttempts}: provider error (${turnErr})${retrying ? " — retrying with a fresh session" : ""}`);
+        if (retrying) { await _delay(backoffMs * attempt); continue; }
+        throw new Error(`Delegation failed after ${maxAttempts} attempts. Last error: ${turnErr}`);
+      }
       const u = await client.getSessionUsage(sessionId, { timeoutMs: 8_000 }).catch(() => null);
       const tokNote = u
         ? ` Only ${(u.output ?? 0).toLocaleString()} output tokens were generated — the ${(u.total ?? 0).toLocaleString()} total is cached input context, not new work.`

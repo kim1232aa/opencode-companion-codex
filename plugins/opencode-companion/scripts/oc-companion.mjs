@@ -37,7 +37,7 @@ import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
-const SERVER_VERSION = "0.4.1";
+const SERVER_VERSION = "0.4.2";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // Plugin root — the directory that holds prompts/ and schemas/. Reviews read

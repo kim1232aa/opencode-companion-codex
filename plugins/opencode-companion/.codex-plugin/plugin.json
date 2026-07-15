@@ -1,6 +1,6 @@
 {
   "name": "opencode-companion",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Delegate coding tasks from Codex to OpenCode on any OpenAI-compatible backend, with blocking results, token usage, and crash-safe result recovery.",
   "author": {
     "name": "kim1232aa"

@@ -11,14 +11,17 @@ const extract = (r) => (r && typeof r.text === "string" ? r.text : "");
  * per-attempt behavior; `calls` records how many times each method ran so a
  * test can assert that an empty turn is NOT retried.
  */
-function makeClient({ sendPrompt, usage } = {}) {
-  const calls = { sendPrompt: 0, createSession: 0, abortSession: 0, getSessionUsage: 0 };
+function makeClient({ sendPrompt, usage, lastTurnError = null } = {}) {
+  const calls = { sendPrompt: 0, createSession: 0, abortSession: 0, getSessionUsage: 0, getLastTurnError: 0 };
   let seq = 0;
   const client = {
     calls,
     createSession: async () => { calls.createSession++; return { id: `s${++seq}` }; },
     getSessionUsage: async () => { calls.getSessionUsage++; return usage ?? { total: 0, output: 0, turns: 0 }; },
     abortSession: async () => { calls.abortSession++; },
+    // The dispatch loop consults this before declaring an empty turn
+    // deterministic: an empty turn the PROVIDER errored on is transient.
+    getLastTurnError: async () => { calls.getLastTurnError++; return lastTurnError; },
     sendPrompt: async (sessionId, prompt, opts) => {
       calls.sendPrompt++;
       return sendPrompt(calls.sendPrompt, sessionId, prompt, opts);
@@ -87,6 +90,22 @@ describe("dispatchWithRetry", () => {
     );
     // The whole point: an empty turn is deterministic, so exactly one call.
     assert.equal(client.calls.sendPrompt, 1);
+  });
+
+  it("RETRIES an empty turn the PROVIDER errored on (rate-limit / cooling down) — not misreported as deterministic", async () => {
+    // The turn came back empty because the provider errored on it (a rate-limit,
+    // "credentials cooling down", a 502 queue drop) — TRANSIENT, must be retried
+    // and reported honestly, not written off as "deterministic; try another model".
+    const client = makeClient({
+      sendPrompt: () => ({ text: "" }),
+      lastTurnError: "All credentials for model X are cooling down",
+    });
+    await assert.rejects(
+      dispatchWithRetry(opts(client)),
+      (err) => /cooling down/.test(err.message) && /after 3 attempts/i.test(err.message)
+        && !/looks deterministic/.test(err.message),
+    );
+    assert.equal(client.calls.sendPrompt, 3, "a provider-errored empty turn is retried on fresh sessions");
   });
 
   it("omits the token note when usage is unavailable but still refuses to retry", async () => {

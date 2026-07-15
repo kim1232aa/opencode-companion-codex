@@ -242,7 +242,10 @@ export const OUTPUT_BUDGET_HEADER = [
  * @returns {string} "" when the budget is off
  */
 export function buildOutputBudget(opts = {}) {
-  const brief = opts.brief === undefined ? DEFAULT_BRIEF : !!opts.brief;
+  // Default ON. When set explicitly, require a real boolean `true` (not a truthy
+  // string like "false", which `!!` would wrongly re-enable) so only the CLI's
+  // parsed flag / MCP's boolean can turn the budget on.
+  const brief = opts.brief === undefined ? DEFAULT_BRIEF : opts.brief === true;
   // brief:false is a real escape hatch: it drops the cap with the budget, so a
   // caller that asked for long output never gets a word limit smuggled back in.
   if (!brief) return "";

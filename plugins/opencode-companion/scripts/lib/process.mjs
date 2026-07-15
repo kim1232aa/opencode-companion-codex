@@ -93,7 +93,11 @@ export function signalGroup(pid, sig, { group = true } = {}) {
  * SIGTERM a detached worker's process GROUP, wait up to `graceMs` for it to
  * exit, then SIGKILL any survivor — the SAME TERM→KILL escalation runCommand
  * uses for its own children, but AWAITABLE, so a caller (the `x`/Ctrl-C cancel
- * path) can block until the worker is provably gone before it exits itself.
+ * path) can block until the worker has exited — or, once SIGKILL is sent, until
+ * the kernel has had a tick to reap it — before it exits itself. It does NOT
+ * promise the pid is provably gone: a process wedged in uninterruptible sleep
+ * (D state) can still probe alive after SIGKILL, which is why the return value
+ * carries an honest `alive` flag rather than asserting death.
  * (runCommand's own escalation is fire-and-forget via a timer, which a signal
  * handler cannot use: once the handler calls process.exit the timer never fires.)
  *

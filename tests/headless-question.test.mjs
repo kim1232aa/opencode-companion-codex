@@ -180,6 +180,39 @@ describe("watchAndRejectQuestions — auto-reject a headless `question`", () => 
     assert.match(stderr.join(""), /got HTTP 503; will retry/);
   });
 
+  it("does NOT treat a 400 reject as 'resolved' — our request failed, so it retries", async () => {
+    // A 400 means OUR reject was rejected — the question is STILL pending. Marking
+    // it handled would falsely claim we rejected a prompt that is still hanging the
+    // session (the exact hang this watcher exists to prevent). Only 404/409 = gone.
+    let rejectAttempts = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      if (u.endsWith("/question")) return jsonRes([{ id: "que_1", sessionID: "ses_mine", questions: [] }]);
+      rejectAttempts++;
+      return rejectAttempts === 1 ? jsonRes(null, 400) : jsonRes(true);
+    };
+    const w = watchAndRejectQuestions("http://127.0.0.1:4096", {}, "ses_mine");
+    const ok = await waitFor(() => rejectAttempts >= 2, 5000);
+    w.stop();
+    assert.ok(ok, `a 400 reject was wrongly treated as resolved and never retried (attempts: ${rejectAttempts})`);
+    assert.match(stderr.join(""), /got HTTP 400; will retry/);
+  });
+
+  it("treats a 404 reject (question already gone) as resolved — handled, not retried", async () => {
+    let rejectAttempts = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      if (u.endsWith("/question")) return jsonRes([{ id: "que_1", sessionID: "ses_mine", questions: [] }]);
+      rejectAttempts++;
+      return jsonRes({ error: "QuestionNotFound" }, 404);
+    };
+    const w = watchAndRejectQuestions("http://127.0.0.1:4096", {}, "ses_mine");
+    await waitFor(() => stderr.join("").includes("auto-rejected"), 3000);
+    w.stop();
+    assert.match(stderr.join(""), /auto-rejected a 'question' tool call/, "a 404 (gone) counts as resolved");
+    assert.equal(rejectAttempts, 1, "a resolved question is not re-rejected");
+  });
+
   it("is a no-op against a server with no /question endpoint (older build)", async () => {
     const calls = [];
     globalThis.fetch = async (url, init = {}) => {
