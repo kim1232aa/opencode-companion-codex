@@ -66,6 +66,71 @@ export async function getOpencodeVersion() {
 }
 
 /**
+ * Signal a detached child's whole process GROUP (POSIX), or just the process
+ * itself when we don't own a group (Windows, or `group: false`). Swallows the
+ * "already gone" (ESRCH) / "not signalable" (EPERM) races so a kill that loses a
+ * race with the process's own exit is never fatal.
+ *
+ * This is the single home of the `process.kill(-pid, …)` group-signal dance:
+ * runCommand's timeout/overflow kills AND the foreground cancel path both go
+ * through here instead of open-coding the negative-pid trick and its try/catch.
+ *
+ * @param {number|undefined} pid - the group leader's pid (its PGID equals its pid)
+ * @param {NodeJS.Signals|number} sig
+ * @param {{ group?: boolean }} [opts]
+ */
+export function signalGroup(pid, sig, { group = true } = {}) {
+  if (!pid) return;
+  try {
+    if (group && process.platform !== "win32") process.kill(-pid, sig);
+    else process.kill(pid, sig);
+  } catch {
+    /* already gone (ESRCH) or not signalable by us (EPERM) */
+  }
+}
+
+/**
+ * SIGTERM a detached worker's process GROUP, wait up to `graceMs` for it to
+ * exit, then SIGKILL any survivor — the SAME TERM→KILL escalation runCommand
+ * uses for its own children, but AWAITABLE, so a caller (the `x`/Ctrl-C cancel
+ * path) can block until the worker is provably gone before it exits itself.
+ * (runCommand's own escalation is fire-and-forget via a timer, which a signal
+ * handler cannot use: once the handler calls process.exit the timer never fires.)
+ *
+ * Liveness is checked with the injected `isAlive` predicate; the companion
+ * passes an OWNERSHIP-aware one so a recycled pid is never mistaken for the
+ * worker. It defaults to a bare `process.kill(pid, 0)` probe.
+ *
+ * @param {number} pid
+ * @param {{ graceMs?: number, pollMs?: number, group?: boolean,
+ *           isAlive?: (pid: number) => boolean }} [opts]
+ * @returns {Promise<{ signaled: boolean, escalated: boolean, alive: boolean }>}
+ */
+export async function terminateGroup(pid, opts = {}) {
+  const { graceMs = 2000, pollMs = 100, group = true } = opts;
+  const isAlive = opts.isAlive ?? ((p) => {
+    try { process.kill(p, 0); return true; } catch (err) { return err.code === "EPERM"; }
+  });
+
+  if (!pid || !isAlive(pid)) return { signaled: false, escalated: false, alive: false };
+
+  signalGroup(pid, "SIGTERM", { group });
+
+  const deadline = Date.now() + Math.max(0, graceMs);
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return { signaled: true, escalated: false, alive: false };
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  if (!isAlive(pid)) return { signaled: true, escalated: false, alive: false };
+
+  // Still alive after the grace period — a child that ignores SIGTERM (or left
+  // grandchildren holding on) can't wedge us open. Escalate.
+  signalGroup(pid, "SIGKILL", { group });
+  await new Promise((r) => setTimeout(r, pollMs)); // let the kernel reap it
+  return { signaled: true, escalated: true, alive: isAlive(pid) };
+}
+
+/**
  * Run a command and return { stdout, stderr, exitCode }.
  * @param {string} cmd
  * @param {string[]} args
@@ -102,14 +167,8 @@ export function runCommand(cmd, args, opts = {}) {
     let killTimer = null;
     let graceTimer = null;
     // Signal the whole process group when we own one, else just the child.
-    const signalTree = (sig) => {
-      try {
-        if (useGroup && proc.pid) process.kill(-proc.pid, sig);
-        else proc.kill(sig);
-      } catch {
-        /* already gone */
-      }
-    };
+    // Goes through the shared signalGroup so the negative-pid dance lives once.
+    const signalTree = (sig) => signalGroup(proc.pid, sig, { group: useGroup });
     // SIGTERM, then SIGKILL after a short grace — so a child that ignores
     // SIGTERM (or leaves grandchildren holding the pipe) can't wedge us open.
     const escalateKill = () => {
