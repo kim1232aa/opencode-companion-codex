@@ -39,6 +39,12 @@ function resolvePromptTimeoutMs() {
  * @returns {Promise<{ status: number, body: string }>}
  */
 function httpPostJson(urlString, headers, bodyObj, opts = {}) {
+  // opts.aborter: caller-owned handle for cutting the in-flight request loose.
+  // The stall watchdog aborts the SESSION server-side, which normally makes
+  // this POST return — but a wedged server that accepts the abort and never
+  // answers left the request (and the whole attempt) parked until the full
+  // wall-clock timeout (30 min default). The watchdog now also destroys the
+  // request client-side via this hook, so a stalled attempt ends immediately.
   const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
     ? opts.timeoutMs
     : resolvePromptTimeoutMs();
@@ -75,6 +81,12 @@ function httpPostJson(urlString, headers, bodyObj, opts = {}) {
     );
 
     req.on("error", (err) => finish(reject, err));
+    if (opts.aborter && typeof opts.aborter === "object") {
+      opts.aborter.abort = (reason) => {
+        finish(reject, new Error(reason || "request aborted by caller"));
+        try { req.destroy(); } catch { /* already gone */ }
+      };
+    }
     timer = setTimeout(() => {
       finish(reject, new Error(
         `OpenCode prompt exceeded ${Math.round(timeoutMs / 1000)}s wall-clock timeout ` +
@@ -658,7 +670,8 @@ export function createClient(baseUrl, opts = {}) {
         ({ status, body: responseText } = await httpPostJson(
           `${baseUrl}/session/${sessionId}/message`,
           headers,
-          body
+          body,
+          { aborter: opts.aborter }
         ));
       } finally {
         permissionWatcher.stop();
@@ -921,43 +934,58 @@ export async function dispatchWithRetry(opts) {
     // parts across beats; `activitySince` drops a resumed session's old commands.
     const activitySeen = new Set();
     const activitySince = Date.now();
+    // Handle for cutting THIS attempt's in-flight prompt POST loose on stall
+    // (httpPostJson fills in .abort). Server-side abortSession normally unblocks
+    // the POST, but a wedged server would otherwise park it for the full
+    // wall-clock timeout.
+    const promptAborter = {};
     const beat = setInterval(async () => {
-      // Surface OpenCode's internal tool calls (bash/edit/read …) so status can
-      // show what it is actually running, not just a token count. Logged BEFORE
-      // the heartbeat so the heartbeat stays the freshest line (age/token parse).
-      // Polled even without a `log` sink, because the stall classifier below
-      // reads it. Best-effort + guarded: an older client without
-      // getSessionActivity (or a fetch failure) simply yields no activity.
-      if (typeof client.getSessionActivity === "function") {
-        const acts = await client
-          .getSessionActivity(sessionId, { since: activitySince, seen: activitySeen, timeoutMs: 8_000 })
-          .catch(() => []);
-        for (const a of acts) {
-          lastToolWasQuestion = /^question\b/i.test(a);
-          if (log) log(`activity: ${a}`);
+      // The whole beat body is guarded: it is an ASYNC setInterval callback, so
+      // any throw that escapes (e.g. `log` → appendLine failing on a full disk)
+      // would become an unhandled rejection instead of a caught error — the
+      // heartbeat must never be able to take the dispatcher down.
+      try {
+        // Surface OpenCode's internal tool calls (bash/edit/read …) so status can
+        // show what it is actually running, not just a token count. Logged BEFORE
+        // the heartbeat so the heartbeat stays the freshest line (age/token parse).
+        // Polled even without a `log` sink, because the stall classifier below
+        // reads it. Best-effort + guarded: an older client without
+        // getSessionActivity (or a fetch failure) simply yields no activity.
+        if (typeof client.getSessionActivity === "function") {
+          const acts = await client
+            .getSessionActivity(sessionId, { since: activitySince, seen: activitySeen, timeoutMs: 8_000 })
+            .catch(() => []);
+          for (const a of acts) {
+            lastToolWasQuestion = /^question\b/i.test(a);
+            if (log) log(`activity: ${a}`);
+          }
         }
-      }
-      const u = await client.getSessionUsage(sessionId, { timeoutMs: 8_000 }).catch(() => null);
-      const total = u?.total ?? 0;
-      // Heartbeat every beat (even at 0 tokens) so log freshness tracks liveness.
-      if (log) {
-        log(total > 0
-          ? `heartbeat: ${total.toLocaleString()} tokens so far (${u?.turns ?? "?"} turn${u?.turns === 1 ? "" : "s"})`
-          : `heartbeat: connected, 0 tokens yet (model has not emitted)`);
-      }
-      if (total > lastTotal) { lastTotal = total; lastProgressAt = Date.now(); }
-      else if (Date.now() - lastProgressAt >= stallMs) {
-        stalled = true;
-        clearInterval(beat);
-        client.abortSession(sessionId).catch(() => {}); // unblocks sendPrompt
-      }
+        const u = await client.getSessionUsage(sessionId, { timeoutMs: 8_000 }).catch(() => null);
+        const total = u?.total ?? 0;
+        // Heartbeat every beat (even at 0 tokens) so log freshness tracks liveness.
+        if (log) {
+          log(total > 0
+            ? `heartbeat: ${total.toLocaleString()} tokens so far (${u?.turns ?? "?"} turn${u?.turns === 1 ? "" : "s"})`
+            : `heartbeat: connected, 0 tokens yet (model has not emitted)`);
+        }
+        if (total > lastTotal) { lastTotal = total; lastProgressAt = Date.now(); }
+        else if (Date.now() - lastProgressAt >= stallMs) {
+          stalled = true;
+          clearInterval(beat);
+          client.abortSession(sessionId).catch(() => {}); // unblocks sendPrompt server-side…
+          // …and cut the in-flight POST loose client-side too: a wedged server
+          // that swallows the abort would otherwise park this attempt until the
+          // full wall-clock prompt timeout (30 min default).
+          promptAborter.abort?.(stallReason);
+        }
+      } catch { /* heartbeat is best-effort; the stall/timeout machinery still bounds the attempt */ }
     }, beatMs);
     beat.unref?.();
 
     let response;
     let threw = null;
     try {
-      response = await client.sendPrompt(sessionId, prompt, { agent, model });
+      response = await client.sendPrompt(sessionId, prompt, { agent, model, aborter: promptAborter });
     } catch (err) {
       threw = err;
     }
@@ -1017,5 +1045,7 @@ export async function dispatchWithRetry(opts) {
     // (4) SUCCESS.
     return { response, sessionId, attempts: attempt, empty: false };
   }
-  throw lastErr;
+  // Reachable only when the loop body never ran (maxAttempts < 1) — every
+  // in-loop path returns, throws, or continues. Never `throw null`.
+  throw lastErr ?? new Error(`dispatchWithRetry: maxAttempts must be >= 1 (got ${maxAttempts})`);
 }

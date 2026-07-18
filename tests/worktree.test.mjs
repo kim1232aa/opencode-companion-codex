@@ -156,5 +156,10 @@ describe("withWorktree", { skip: !hasGit }, () => {
     );
     // The worktree is preserved so the stranded work can be recovered.
     assert.ok(fs.existsSync(wtRoot), "worktree must be kept for recovery on a failed writeback");
+    // The preserved patch (full source diff in the shared tmpdir) is 0600 —
+    // same owner-only policy as the state/result files.
+    const patchFile = path.join(os.tmpdir(), "opencode-wt-job-conflict.patch");
+    assert.ok(fs.existsSync(patchFile), "patch must be preserved for recovery");
+    assert.equal(fs.statSync(patchFile).mode & 0o777, 0o600, "patch file must be owner-only");
   });
 });

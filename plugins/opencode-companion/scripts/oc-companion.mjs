@@ -37,7 +37,7 @@ import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.5.1";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // Plugin root — the directory that holds prompts/ and schemas/. Reviews read
@@ -425,6 +425,10 @@ async function handleDelegate(args, requestId) {
             if (exact.length === 1) {
               log(`Model "${args.model}" resolved to "${exact[0]}" (added the provider prefix).`);
               args.model = exact[0];
+              // Keep the job record consistent with the trailer: it was created
+              // BEFORE resolution, so status/watch showed the raw ref while the
+              // result showed the resolved one.
+              upsertJob(workspace, { id: job.id, requestedModel: args.model });
             } else {
               const sugg = suggestModelRefs(refs, args.model);
               throw new Error(

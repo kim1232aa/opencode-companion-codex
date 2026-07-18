@@ -123,7 +123,12 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
       // runCommand cannot feed stdin (stdio[0] === "ignore"), so `git apply -`
       // would read nothing. Write the patch to a temp file and apply from it.
       patchFile = path.join(os.tmpdir(), `opencode-wt-${safeJob}.patch`);
-      fs.writeFileSync(patchFile, patch);
+      // 0600: the patch is the task's full source diff, sitting in the shared
+      // tmpdir — same owner-only policy as the state/result files. Remove any
+      // stale same-named file first: writeFileSync applies `mode` only on
+      // CREATION, so a leftover 0644 file from an old run would keep its mode.
+      try { fs.unlinkSync(patchFile); } catch { /* none */ }
+      fs.writeFileSync(patchFile, patch, { mode: 0o600 });
       const apply = await runCommand("git", ["-C", top, "apply", "--whitespace=nowarn", patchFile])
         .catch((e) => ({ exitCode: 1, stderr: e.message, stdout: "" }));
       if (apply.exitCode !== 0) {
