@@ -493,11 +493,21 @@ export function createClient(baseUrl, opts = {}) {
       try {
         const msgs = await request("GET", `/session/${sessionId}/message`, undefined, timeoutMs);
         const list = Array.isArray(msgs) ? msgs : [];
+        // Fail OPEN on the window: a build that omits time.created (or stamps it
+        // in seconds) would have the since-filter drop EVERY turn — an all-zero
+        // accumulator makes the trailer (and its model-mismatch ⚠️) silently
+        // vanish on a run that really spent tokens. If the window matches
+        // nothing but assistant turns exist, fall back to the whole-session sum
+        // (the pre-window behavior): over-reporting a resumed session beats
+        // reporting zero.
+        const effSince = since && list.some((m) => m?.info?.role === "assistant" && (m.info.time?.created ?? 0) >= since)
+          ? since
+          : 0;
         const acc = { total: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, model: null };
         for (const m of list) {
           const info = m?.info;
           if (!info || info.role !== "assistant") continue;
-          if (since && !((info.time?.created ?? 0) >= since)) continue;
+          if (effSince && !((info.time?.created ?? 0) >= effSince)) continue;
           const t = info.tokens || {};
           const input = t.input || 0;
           const output = t.output || 0;

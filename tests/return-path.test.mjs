@@ -57,6 +57,39 @@ describe("getSessionUsage — since window", () => {
   });
 });
 
+describe("getSessionUsage — since window fails OPEN on timestamp-less builds", () => {
+  // Adversarially found regression: a build that omits info.time.created (or
+  // stamps it in seconds) had the since-filter drop EVERY turn → all-zero
+  // usage → the trailer (and its model-mismatch ⚠️) silently vanished on a run
+  // that really spent tokens. When the window matches nothing but assistant
+  // turns exist, the whole-session sum is returned instead.
+  let s2, url2;
+  before(async () => {
+    const NO_TS = [
+      { info: { role: "assistant", tokens: { input: 100, output: 40 }, cost: 1, providerID: "p", modelID: "m" },
+        parts: [{ type: "text", text: "a" }] },
+      { info: { role: "assistant", time: { created: 1_700_000 }, tokens: { input: 10, output: 2 }, cost: 0.1, providerID: "p", modelID: "m" },
+        parts: [{ type: "text", text: "b" }] }, // "seconds-unit" stamp — far below an ms-epoch since
+    ];
+    s2 = http.createServer((req, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(NO_TS)); });
+    await new Promise((r) => s2.listen(0, "127.0.0.1", r));
+    url2 = `http://127.0.0.1:${s2.address().port}`;
+  });
+  after(() => s2.close());
+
+  it("falls back to the full-session sum instead of reporting zero", async () => {
+    const u = await createClient(url2).getSessionUsage("s", { since: Date.now() });
+    assert.equal(u.turns, 2, "must not report an empty run");
+    assert.equal(u.output, 42);
+    assert.equal(u.model, "p/m", "model (and the mismatch warning) must not vanish");
+  });
+
+  it("a normal ms-timestamp build still gets the window", async () => {
+    const u = await createClient(baseUrl).getSessionUsage("s1", { since: T1 });
+    assert.equal(u.turns, 2, "window still applies when it matches something");
+  });
+});
+
 describe("getSessionResult — since/until window", () => {
   it("picks THIS job's answer, not a later job's, when until bounds the window", async () => {
     const r = await createClient(baseUrl).getSessionResult("s1", { since: T1, until: T2 - 1 });
