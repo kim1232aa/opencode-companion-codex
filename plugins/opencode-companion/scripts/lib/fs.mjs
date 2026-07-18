@@ -173,7 +173,15 @@ export function withFileLock(lockPath, fn) {
   for (;;) {
     try {
       fs.mkdirSync(lockPath);
-      fs.writeFileSync(lockOwnerFile(lockPath), token, "utf8");
+      try {
+        fs.writeFileSync(lockOwnerFile(lockPath), token, "utf8");
+      } catch (writeErr) {
+        // We created the dir but couldn't stamp our token (ENOSPC/EACCES).
+        // Leaving an OWNERLESS lock would block every other writer for the
+        // 60s age-fallback — remove what we made before propagating.
+        try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch { /* best-effort */ }
+        throw writeErr;
+      }
       break;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;

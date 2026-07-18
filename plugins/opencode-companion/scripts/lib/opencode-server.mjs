@@ -287,7 +287,7 @@ function watchAndRejectPermissions(baseUrl, headers, sessionId) {
       } catch {
         // Transient poll failure — try again next tick.
       }
-      await new Promise((r) => setTimeout(r, PERMISSION_POLL_INTERVAL_MS));
+      await new Promise((r) => { const t = setTimeout(r, PERMISSION_POLL_INTERVAL_MS); t.unref?.(); });
     }
   })();
 
@@ -375,7 +375,7 @@ export function watchAndRejectQuestions(baseUrl, headers, sessionId) {
       } catch {
         // Transient poll failure — try again next tick.
       }
-      await new Promise((r) => setTimeout(r, QUESTION_POLL_INTERVAL_MS));
+      await new Promise((r) => { const t = setTimeout(r, QUESTION_POLL_INTERVAL_MS); t.unref?.(); });
     }
   })();
 
@@ -570,8 +570,13 @@ export function createClient(baseUrl, opts = {}) {
           if (last?.role === "user" && (!since || (last.time?.created ?? 0) >= since)) active = true;
         }
         return { text: doneText, active };
-      } catch {
-        return { text: null, active: false };
+      } catch (err) {
+        // PROPAGATE. Swallowing this into {text:null, active:false} made an
+        // unreachable/timed-out probe indistinguishable from "server is idle
+        // with no answer", so recovery marked a still-generating job failed —
+        // and the caller's own "probe failed" logging was dead code. The one
+        // caller (recoverStrandedResults) catches and keeps the job alive.
+        throw err instanceof Error ? err : new Error(String(err));
       }
     },
 

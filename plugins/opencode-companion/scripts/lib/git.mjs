@@ -80,24 +80,6 @@ export async function getDiff(cwd, opts = {}) {
 }
 
 /**
- * Get a short diff stat for size estimation.
- * @param {string} cwd
- * @param {{ base?: string, cached?: boolean }} opts
- * @returns {Promise<string>}
- */
-export async function getDiffStat(cwd, opts = {}) {
-  const args = ["diff", "--shortstat"];
-  if (opts.base) {
-    args.push(`${assertSafeRef(opts.base)}...HEAD`);
-  } else if (opts.cached) {
-    args.push("--cached");
-  } else {
-    args.push("HEAD");
-  }
-  return (await gitOrThrow(cwd, args)).trim();
-}
-
-/**
  * Get git status (short format).
  * @param {string} cwd
  * @returns {Promise<string>}

@@ -1,7 +1,7 @@
 // Job control: query, sort, enrich, and build status snapshots.
 
 import { tailLines, pidStartTime, writeJson, appendLine } from "./fs.mjs";
-import { jobLogPath, jobDataPath, upsertJob, loadState } from "./state.mjs";
+import { jobLogPath, jobDataPath, upsertJob, updateState, loadState } from "./state.mjs";
 import { createClient, isServerRunning } from "./opencode-server.mjs";
 
 const RECOVERY_PROBE_TIMEOUT_MS = 8_000;
@@ -117,7 +117,7 @@ export function reconcileStrandedJobs(workspacePath, jobs) {
  * @param {string} serverUrl
  * @returns {Promise<object[]>}
  */
-export async function recoverStrandedResults(workspacePath, jobs, serverUrl) {
+export async function recoverStrandedResults(workspacePath, jobs, serverUrl, deps = {}) {
   const candidates = (jobs ?? []).filter((j) => {
     const terminal = j.status === "completed" || j.status === "failed" || j.status === "canceled";
     if (terminal || !j.opencodeSessionId) return false;
@@ -137,9 +137,10 @@ export async function recoverStrandedResults(workspacePath, jobs, serverUrl) {
   } catch {
     /* use isServerRunning defaults */
   }
-  if (!(await isServerRunning(host, port))) return jobs;
+  const healthy = deps.healthy ?? (await isServerRunning(host, port));
+  if (!healthy) return jobs;
 
-  const client = createClient(serverUrl);
+  const client = deps.client ?? createClient(serverUrl);
   for (const j of candidates) {
     const since = Date.parse(j.createdAt || "") || 0;
     let probe = { text: null, active: false };
@@ -149,34 +150,54 @@ export async function recoverStrandedResults(workspacePath, jobs, serverUrl) {
         timeoutMs: RECOVERY_PROBE_TIMEOUT_MS,
       });
     } catch (err) {
-      // Keep the reason. A probe throw (server unreachable / timeout / auth)
-      // leaves the job unrecovered, and it later reconciles to `failed` — but
-      // without this the operator can't tell "the server had no answer" from
-      // "we couldn't reach the server to ask". Best-effort log; logging must
-      // never break recovery itself.
-      probe = { text: null, active: false };
+      // Probe FAILURE ≠ "server has no answer". The health check above said the
+      // server is up, so a throw here means busy/slow/transient — treating it as
+      // "no answer" let reconcile mark a still-generating job `failed` while its
+      // session kept running (and a later probe then flipped it back to
+      // completed: contradictory outcomes). Keep the job alive like an active
+      // turn and let the next poll retry; the awaitingServer bound in
+      // reconcileStrandedJobs still prevents a forever-zombie.
       try {
         appendLine(jobLogPath(workspacePath, j.id), `[${new Date().toISOString()}] recovery probe failed: ${err.message}`);
       } catch { /* logging is best-effort */ }
+      upsertJob(workspacePath, {
+        id: j.id,
+        awaitingServer: true,
+        awaitingServerSince: j.awaitingServerSince ?? new Date().toISOString(),
+      });
+      continue;
     }
     if (probe.text) {
       const usage = await client
         .getSessionUsage(j.opencodeSessionId, { timeoutMs: RECOVERY_PROBE_TIMEOUT_MS })
         .catch(() => null);
-      writeJson(jobDataPath(workspacePath, j.id), {
-        rendered: probe.text,
-        usage,
-        recovered: true,
-        summary: probe.text.slice(0, 500),
+      // CAS the finalize INSIDE the state lock — the candidate set was
+      // snapshotted BEFORE the (up to 8s) probe await, so a user cancel can land
+      // mid-probe. Every other finalize guards on running/pending; without the
+      // same guard here the cancel was silently overwritten back to "completed"
+      // AND a result data file was persisted for a canceled job — double
+      // contract violation. Claim first; only a successful claim writes data.
+      let finalized = false;
+      updateState(workspacePath, (state) => {
+        const job = state.jobs?.find((x) => x.id === j.id);
+        if (!job) return;
+        if (job.status !== "running" && job.status !== "pending") return; // e.g. canceled mid-probe
+        job.status = "completed";
+        job.completedAt = new Date().toISOString();
+        job.result = probe.text.slice(0, 500);
+        job.recovered = true;
+        job.awaitingServer = false;
+        job.updatedAt = new Date().toISOString();
+        finalized = true;
       });
-      upsertJob(workspacePath, {
-        id: j.id,
-        status: "completed",
-        completedAt: new Date().toISOString(),
-        result: probe.text.slice(0, 500),
-        recovered: true,
-        awaitingServer: false,
-      });
+      if (finalized) {
+        writeJson(jobDataPath(workspacePath, j.id), {
+          rendered: probe.text,
+          usage,
+          recovered: true,
+          summary: probe.text.slice(0, 500),
+        });
+      }
     } else if (probe.active) {
       // Worker is gone but the server is still generating our answer — keep the
       // job alive so a later poll can recover it instead of failing it now.
@@ -331,23 +352,6 @@ export function resolveResultJob(jobs, ref, opts = {}) {
     return { job: sorted[0] ?? null, ambiguous: false };
   }
   return matchJobReference(pool, ref);
-}
-
-/**
- * Resolve a job that can be canceled (running).
- * @param {object[]} jobs
- * @param {string} [ref]
- * @returns {{ job: object|null, ambiguous: boolean }}
- */
-export function resolveCancelableJob(jobs, ref, opts = {}) {
-  const running = jobs.filter((j) => j.status === "running" || j.status === "pending");
-  if (!ref) {
-    const scoped = opts.sessionId
-      ? running.filter((j) => j.sessionId === opts.sessionId)
-      : running;
-    return { job: scoped[0] ?? null, ambiguous: scoped.length > 1 };
-  }
-  return matchJobReference(running, ref);
 }
 
 /**

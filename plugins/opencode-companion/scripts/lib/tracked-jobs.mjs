@@ -258,23 +258,3 @@ export async function runTrackedJob(workspacePath, job, runner) {
   }
 }
 
-/**
- * Create a progress reporter for a job.
- * @param {string} workspacePath
- * @param {string} jobId
- * @returns {{ report: Function, log: Function }}
- */
-export function createProgressReporter(workspacePath, jobId) {
-  const logFile = jobLogPath(workspacePath, jobId);
-
-  return {
-    report(phase, message) {
-      const line = `[${new Date().toISOString()}] [${phase}] ${message}`;
-      appendLine(logFile, line);
-      upsertJob(workspacePath, { id: jobId, phase });
-    },
-    log(message) {
-      appendLine(logFile, `[${new Date().toISOString()}] ${message}`);
-    },
-  };
-}

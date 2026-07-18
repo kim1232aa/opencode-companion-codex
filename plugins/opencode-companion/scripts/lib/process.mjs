@@ -154,8 +154,13 @@ export function runCommand(cmd, args, opts = {}) {
       env: { ...process.env, ...opts.env },
       detached: useGroup,
     });
-    let stdout = "";
-    let stderr = "";
+    // Accumulate raw Buffer chunks and decode ONCE at settle time. The old
+    // `str += chunk` coerced每个 chunk 单独 toString():a multibyte UTF-8 char
+    // split across a stream read boundary (~64KiB) decoded to U+FFFD pairs —
+    // which silently corrupted large CJK diffs captured for the worktree
+    // writeback, and `git apply` then applied the corrupted patch with exit 0.
+    const stdoutChunks = [];
+    const stderrChunks = [];
     let settled = false;
     let overflowed = false;
     let timedOut = false;
@@ -196,17 +201,17 @@ export function runCommand(cmd, args, opts = {}) {
           overflowed = true;
           const remaining = Math.max(0, maxOutputBytes - stdoutBytes);
           if (remaining > 0) {
-            stdout += d.subarray(0, remaining).toString();
+            stdoutChunks.push(d.subarray(0, remaining));
             stdoutBytes += remaining;
           }
           escalateKill();
           return;
         }
-        stdout += d;
+        stdoutChunks.push(d);
         stdoutBytes += d.length;
         return;
       }
-      stdout += d;
+      stdoutChunks.push(d);
     });
     proc.stderr.on("data", (d) => {
       if (settled || overflowed) return;
@@ -215,17 +220,17 @@ export function runCommand(cmd, args, opts = {}) {
           overflowed = true;
           const remaining = Math.max(0, maxOutputBytes - stderrBytes);
           if (remaining > 0) {
-            stderr += d.subarray(0, remaining).toString();
+            stderrChunks.push(d.subarray(0, remaining));
             stderrBytes += remaining;
           }
           escalateKill();
           return;
         }
-        stderr += d;
+        stderrChunks.push(d);
         stderrBytes += d.length;
         return;
       }
-      stderr += d;
+      stderrChunks.push(d);
     });
     const clearTimers = () => {
       if (killTimer) clearTimeout(killTimer);
@@ -241,7 +246,14 @@ export function runCommand(cmd, args, opts = {}) {
       if (settled) return;
       settled = true;
       clearTimers();
-      const result = { stdout, stderr, exitCode: exitCode ?? 1 };
+      // Single decode over the concatenated bytes — chunk boundaries can no
+      // longer split a multibyte character. (An overflow cut can still land
+      // mid-character at the very end, but overflow is an honest error path.)
+      const result = {
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        exitCode: exitCode ?? 1,
+      };
       if (maxOutputBytes !== undefined) {
         result.overflowed = overflowed;
       }

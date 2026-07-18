@@ -37,7 +37,7 @@ import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
-const SERVER_VERSION = "0.4.5";
+const SERVER_VERSION = "0.5.0";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // Plugin root — the directory that holds prompts/ and schemas/. Reviews read
@@ -225,6 +225,20 @@ export async function resolveWorkspaceArg(args) {
 }
 
 // ─── Tool definitions ───────────────────────────────────────────────────────
+
+// Per-tool set of declared argument keys, for unknown-key rejection at the
+// tools/call boundary (see handleMessage). MCP hosts pass arguments through
+// structurally, so a typo'd key would otherwise be silently ignored and the
+// parameter it was meant to set would silently default — e.g. {bsae: "main"}
+// reviewing the working tree instead of the branch.
+export function allowedToolArgKeys(toolName) {
+  const tool = TOOLS.find((t) => t.name === toolName);
+  return new Set(Object.keys(tool?.inputSchema?.properties ?? {}));
+}
+export function unknownToolArgKeys(toolName, args) {
+  const allowed = allowedToolArgKeys(toolName);
+  return Object.keys(args ?? {}).filter((k) => !allowed.has(k));
+}
 
 const TOOLS = [
   {
@@ -621,33 +635,16 @@ export async function handleCancel(args, _requestId, deps = {}) {
   const canceled = [];
   const alreadyDone = [];
 
+  // (1) CAS every target to "canceled" FIRST — mirroring the CC frontend's
+  // cancelJobsAndCleanup. Aborting before the CAS raced the in-flight dispatch:
+  // the aborted sendPrompt returns/throws, runTrackedJob's finalize (or the
+  // retry loop's shouldStop) checks the status BEFORE the CAS lands, and the
+  // canceled job finalizes "completed" with a result data file — or a write
+  // task re-runs on a fresh session. CAS-first makes both checks see the cancel.
+  const toTearDown = [];
   for (const job of targets) {
-    // Abort the OpenCode session if we have one (returns its blocked sendPrompt).
-    if (job.opencodeSessionId) {
-      // Time-bounded: a hung server must not stall oc_cancel — the job is
-      // CAS-canceled below regardless, and an in-process delegation has no
-      // worker to fall through to (its sendPrompt unwinds on its own timeout).
-      await withTimeout(
-        Promise.resolve().then(() => client.abortSession(job.opencodeSessionId)),
-        abortMs,
-      ).catch(() => { /* server down / slow */ });
-    }
-    // A detached worker only exists for jobs created by the sibling Claude Code
-    // frontend sharing this store; in-process delegations have none. Ownership is
-    // verified via the pid start-time fingerprint so a recycled pid is never hit.
-    if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
-      // Match the Claude Code frontend: escalate SIGTERM→SIGKILL and signal the
-      // worker's whole process group, so one that traps SIGTERM is still stopped
-      // instead of left burning tokens. Only reachable when both frontends share
-      // a store via OPENCODE_COMPANION_DATA — Codex never spawns its own detached
-      // worker — but then a single unescalated SIGTERM was the weaker path.
-      await terminateGroup(job.pid, { isAlive: (p) => isOwnedProcessAlive(p, job.pidStart) })
-        .catch(() => { /* terminateGroup already swallows signal errors; catch for parity with the CC path */ });
-    }
-    // Compare-and-set INSIDE the state lock: the worker may reach a terminal
-    // status during the abort round-trip, and a check-then-write outside the lock
-    // could clobber that result with "canceled".
     let finalStatus = null;
+    let snapshot = null;
     updateState(workspace, (state) => {
       const j = state.jobs?.find((x) => x.id === job.id);
       if (!j) return;
@@ -657,10 +654,33 @@ export async function handleCancel(args, _requestId, deps = {}) {
       j.errorMessage = "Canceled by user";
       j.updatedAt = new Date().toISOString();
       finalStatus = "canceled";
+      // Fresh in-lock values — the caller's snapshot may be staler.
+      snapshot = { id: j.id, opencodeSessionId: j.opencodeSessionId, detachedWorker: j.detachedWorker, pid: j.pid, pidStart: j.pidStart };
     });
-    if (finalStatus === "canceled") canceled.push(job.id);
+    if (finalStatus === "canceled") { canceled.push(job.id); toTearDown.push(snapshot); }
     else if (finalStatus) alreadyDone.push(`${job.id} (${finalStatus})`);
   }
+
+  // (2) Tear down every freshly-canceled job IN PARALLEL — sequential awaits
+  // made cancel-all cost ~N × (abort timeout + kill grace) against a slow server.
+  await Promise.all(toTearDown.map(async (job) => {
+    // Abort the OpenCode session if we have one (returns its blocked sendPrompt).
+    // Time-bounded: a hung server must not stall oc_cancel — the job is already
+    // CAS-canceled, and an in-process delegation's sendPrompt unwinds on its own.
+    if (job.opencodeSessionId) {
+      await withTimeout(
+        Promise.resolve().then(() => client.abortSession(job.opencodeSessionId)),
+        abortMs,
+      ).catch(() => { /* server down / slow */ });
+    }
+    // A detached worker only exists for jobs created by the sibling Claude Code
+    // frontend sharing this store; in-process delegations have none. Ownership is
+    // verified via the pid start-time fingerprint so a recycled pid is never hit.
+    if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
+      await terminateGroup(job.pid, { isAlive: (p) => isOwnedProcessAlive(p, job.pidStart) })
+        .catch(() => { /* terminateGroup already swallows signal errors; catch for parity with the CC path */ });
+    }
+  }));
 
   const out = [];
   if (canceled.length) out.push(`Canceled ${canceled.length} job${canceled.length === 1 ? "" : "s"}: ${canceled.join(", ")}`);
@@ -943,6 +963,18 @@ async function handleMessage(msg) {
       const handler = HANDLERS[params.name];
       if (!handler) return sendError(msg.id, -32601, `Unknown tool: ${params.name}`);
       const toolArgs = params.arguments && typeof params.arguments === "object" ? params.arguments : {};
+      // Reject unknown argument keys instead of silently dropping them. A typo'd
+      // key ({bsae: "main"}) used to make oc_review silently review the WORKING
+      // TREE instead of the intended branch — the exact bug class the CC CLI
+      // fixed with strict parsing in 2.3.6.
+      const badKeys = unknownToolArgKeys(params.name, toolArgs);
+      if (badKeys.length) {
+        sendResponse(msg.id, errText(
+          `Error: unknown argument${badKeys.length === 1 ? "" : "s"} for ${params.name}: ${badKeys.join(", ")}. ` +
+          `Allowed: ${[...allowedToolArgKeys(params.name)].join(", ")}.`
+        ));
+        break;
+      }
       try {
         const result = await handler(toolArgs, msg.id);
         sendResponse(msg.id, result);
