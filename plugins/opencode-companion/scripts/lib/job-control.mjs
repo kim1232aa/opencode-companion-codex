@@ -138,15 +138,40 @@ export async function recoverStrandedResults(workspacePath, jobs, serverUrl, dep
     /* use isServerRunning defaults */
   }
   const healthy = deps.healthy ?? (await isServerRunning(host, port));
-  if (!healthy) return jobs;
+  if (!healthy) {
+    // Server unreachable at THIS tick ≠ the answer is lost. Returning the jobs
+    // untouched let reconcile take the dead-pid branch and mark them failed —
+    // terminally, so a finished answer became unrecoverable after a transient
+    // blip. Keep the candidates alive (awaitingServer) instead; the
+    // AWAIT_SERVER_MAX_MS bound in reconcileStrandedJobs still fails them
+    // honestly if the server never comes back.
+    for (const j of candidates) {
+      upsertJob(workspacePath, {
+        id: j.id,
+        awaitingServer: true,
+        awaitingServerSince: j.awaitingServerSince ?? new Date().toISOString(),
+      });
+    }
+    return loadState(workspacePath).jobs ?? jobs;
+  }
 
   const client = deps.client ?? createClient(serverUrl);
   for (const j of candidates) {
     const since = Date.parse(j.createdAt || "") || 0;
+    // Upper bound for a SHARED session (--resume-last): if a LATER job reuses
+    // this job's opencodeSessionId, this job's window ends where that one's
+    // begins — otherwise the probe's "latest completed turn" would persist the
+    // later job's answer as this job's result.
+    const laterStarts = (jobs ?? [])
+      .filter((o) => o !== j && o.opencodeSessionId === j.opencodeSessionId)
+      .map((o) => Date.parse(o.createdAt || "") || 0)
+      .filter((t) => t > since);
+    const until = laterStarts.length ? Math.min(...laterStarts) : 0;
     let probe = { text: null, active: false };
     try {
       probe = await client.getSessionResult(j.opencodeSessionId, {
         since,
+        until,
         timeoutMs: RECOVERY_PROBE_TIMEOUT_MS,
       });
     } catch (err) {
@@ -169,7 +194,7 @@ export async function recoverStrandedResults(workspacePath, jobs, serverUrl, dep
     }
     if (probe.text) {
       const usage = await client
-        .getSessionUsage(j.opencodeSessionId, { timeoutMs: RECOVERY_PROBE_TIMEOUT_MS })
+        .getSessionUsage(j.opencodeSessionId, { since, timeoutMs: RECOVERY_PROBE_TIMEOUT_MS })
         .catch(() => null);
       // CAS the finalize INSIDE the state lock — the candidate set was
       // snapshotted BEFORE the (up to 8s) probe await, so a user cancel can land

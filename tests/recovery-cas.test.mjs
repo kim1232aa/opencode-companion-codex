@@ -71,6 +71,38 @@ describe("recoverStrandedResults — CAS finalize", () => {
     assert.equal(existsSync(jobDataPath(w, "race1")), false, "a canceled job must not persist a result data file");
   });
 
+  it("an UNREACHABLE server keeps candidates alive instead of letting them fail terminally", async () => {
+    // Regression: `if (!healthy) return jobs` left dead-worker candidates
+    // untouched, reconcile marked them failed (terminal), and a finished answer
+    // that the server still held became unrecoverable after a transient blip.
+    const w = ws();
+    seedCandidate(w, "blip1");
+    await recoverStrandedResults(w, loadState(w).jobs, "http://127.0.0.1:1", { healthy: false });
+    const j = loadState(w).jobs.find((x) => x.id === "blip1");
+    assert.equal(j.status, "running");
+    assert.equal(j.awaitingServer, true, "kept alive for the next poll (bounded by AWAIT_SERVER_MAX_MS)");
+  });
+
+  it("a shared session (--resume-last) probes each job with an UNTIL bound so answers don't cross-attribute", async () => {
+    const w = ws();
+    // Older job B and newer job A share one session; both stranded.
+    upsertJob(w, { id: "olderB", type: "task", status: "running", opencodeSessionId: "ses_shared",
+      createdAt: new Date(Date.now() - 120_000).toISOString(), pid: 999999999, pidStart: "1" });
+    upsertJob(w, { id: "newerA", type: "task", status: "running", opencodeSessionId: "ses_shared",
+      createdAt: new Date(Date.now() - 30_000).toISOString(), pid: 999999998, pidStart: "1" });
+    const seen = [];
+    const client = {
+      getSessionResult: async (sid, opts) => { seen.push({ sid, since: opts.since, until: opts.until }); return { text: null, active: false }; },
+      getSessionUsage: async () => null,
+    };
+    await recoverStrandedResults(w, loadState(w).jobs, "http://127.0.0.1:1", { client, healthy: true });
+    const forOlder = seen.find((s) => s.since && s.until);
+    assert.ok(forOlder, "the OLDER job's probe must carry an until bound (= the newer job's start)");
+    assert.ok(forOlder.until > forOlder.since, "window must be ordered");
+    const forNewer = seen.find((s) => !s.until);
+    assert.ok(forNewer, "the NEWEST job on the session probes unbounded");
+  });
+
   it("a probe FAILURE keeps the job alive (awaitingServer) and logs the reason", async () => {
     const w = ws();
     seedCandidate(w, "flaky1");

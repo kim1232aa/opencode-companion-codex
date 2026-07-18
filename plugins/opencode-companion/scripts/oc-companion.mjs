@@ -37,7 +37,7 @@ import { assertSafeRef } from "./lib/git.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
 
-const SERVER_VERSION = "0.5.1";
+const SERVER_VERSION = "0.6.0";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // Plugin root — the directory that holds prompts/ and schemas/. Reviews read
@@ -446,6 +446,7 @@ async function handleDelegate(args, requestId) {
 
         // Dispatch with retries: a transient 500, an empty turn, or a hang (no
         // token progress) is retried on a fresh session instead of failing.
+        const dispatchedAt = Date.now(); // usage window: this run's turns only (a RESUMED session carries the previous task's turns)
         const dispatch = await dispatchWithRetry({
           client,
           prompt,
@@ -463,7 +464,7 @@ async function handleDelegate(args, requestId) {
         if (dispatch.attempts > 1) log(`Succeeded on attempt ${dispatch.attempts}.`);
 
         const bodyText = extractResponseText(response);
-        const usage = await client.getSessionUsage(sessionId).catch(() => null);
+        const usage = await client.getSessionUsage(sessionId, { since: dispatchedAt }).catch(() => null);
 
         let changedFiles = [];
         if (isWrite) {
@@ -753,6 +754,28 @@ async function runReview(args, requestId, { adversarial }) {
       report("starting", "Connecting to OpenCode server...");
       const client = await connect({ cwd: workspace });
 
+      // Same model validation/auto-prefix as oc_delegate — without it a bare
+      // "gpt-x" died in parseModelRef, was retried as a transport error, and
+      // failed with a cryptic message instead of "Did you mean …?".
+      if (args.model) {
+        const refs = await client.listModelRefs().catch(() => null);
+        if (refs && refs.size && !refs.has(args.model)) {
+          const exact = suggestModelRefs(refs, args.model, 50).filter((r) => r.endsWith(`/${args.model}`));
+          if (exact.length === 1) {
+            log(`Model "${args.model}" resolved to "${exact[0]}" (added the provider prefix).`);
+            args.model = exact[0];
+            upsertJob(workspace, { id: job.id, requestedModel: args.model });
+          } else {
+            const sugg = suggestModelRefs(refs, args.model);
+            throw new Error(
+              `Model "${args.model}" is not available on the OpenCode server.` +
+              (sugg.length ? ` Did you mean: ${sugg.join("  |  ")} ?` : "") +
+              ` A ref is <providerID>/<modelID>. Run oc_setup to list the exact provider IDs.`
+            );
+          }
+        }
+      }
+
       // Prompt is built from the repo's git diff/status; the adversarial variant
       // reads its template from PLUGIN_ROOT/prompts/adversarial-review.md.
       // brief/maxWords here tighten the PROSE inside the schema's fields; the
@@ -769,6 +792,7 @@ async function runReview(args, requestId, { adversarial }) {
 
       // Retry a transient 500 / empty turn / hang on a fresh session; the
       // read-only 'plan' agent guarantees the review never edits the repo.
+      const dispatchedAt = Date.now(); // usage window: this run's turns only (a RESUMED session carries the previous task's turns)
       const dispatch = await dispatchWithRetry({
         client,
         prompt,
@@ -787,10 +811,15 @@ async function runReview(args, requestId, { adversarial }) {
       report("finalizing", "Processing review output...");
       const bodyText = extractResponseText(response);
       const structured = tryParseJson(bodyText);
-      const usage = await client.getSessionUsage(sessionId).catch(() => null);
+      // Only render as a review when the parse LOOKS like one — the brace-slice
+      // fallback can latch onto an incidental JSON fragment inside prose.
+      const reviewShaped = structured && (Array.isArray(structured)
+        ? structured.some((x) => x && typeof x === "object")
+        : (Array.isArray(structured.findings) || structured.verdict !== undefined || structured.summary !== undefined));
+      const usage = await client.getSessionUsage(sessionId, { since: dispatchedAt }).catch(() => null);
 
       return {
-        rendered: structured ? renderReview(structured) : bodyText,
+        rendered: reviewShaped ? renderReview(structured) : bodyText,
         structured,
         usage,
         opencodeSessionId: sessionId,
@@ -843,7 +872,7 @@ const HANDLERS = {
 
 // ─── Response text extraction (mirrors the Claude Code frontend) ────────────
 
-function extractResponseText(response) {
+export function extractResponseText(response) {
   if (response == null) return "";
   if (typeof response === "string") return response;
   if (Array.isArray(response.parts)) {
@@ -863,7 +892,10 @@ function extractResponseText(response) {
         .join("\n");
     }
   }
-  return JSON.stringify(response, null, 2);
+  // UNKNOWN shape: return empty so the dispatch layer treats it as a failed
+  // turn (provider-error probe + honest error) instead of a "success" whose
+  // answer is a raw JSON dump.
+  return "";
 }
 
 // ─── Structured-output parsing (mirrors the Claude Code frontend) ───────────

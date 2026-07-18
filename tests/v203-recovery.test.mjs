@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { recoverStrandedResults, pidStartTime } from "../plugins/opencode-companion/scripts/lib/job-control.mjs";
+import { upsertJob, loadState } from "../plugins/opencode-companion/scripts/lib/state.mjs";
 
 // An address that refuses fast, to stand in for "server unreachable".
 const DEAD_URL = "http://127.0.0.1:1";
@@ -32,21 +33,22 @@ describe("recoverStrandedResults", () => {
     assert.equal(out, jobs, "no candidates ⇒ same array, no server I/O");
   });
 
-  it("does not throw and does not complete a job when the server is unreachable", async () => {
+  it("keeps a job alive (awaitingServer) instead of completing/failing it when the server is unreachable", async () => {
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), "rec-"));
     try {
-      const jobs = [
-        {
-          id: "x",
-          status: "running",
-          opencodeSessionId: "sess-dead",
-          pid: 999999999, // dead pid
-          pidStart: "1", // fingerprint that can't match ⇒ provably gone
-        },
-      ];
-      const out = await recoverStrandedResults(ws, jobs, DEAD_URL);
+      // Seed via the store (like every real caller): the unhealthy branch
+      // merges via upsertJob and reloads state.
+      upsertJob(ws, {
+        id: "x",
+        status: "running",
+        opencodeSessionId: "sess-dead",
+        pid: 999999999, // dead pid
+        pidStart: "1", // fingerprint that can't match ⇒ provably gone
+      });
+      const out = await recoverStrandedResults(ws, loadState(ws).jobs, DEAD_URL);
       const j = out.find((k) => k.id === "x");
-      assert.equal(j.status, "running", "unreachable server ⇒ leave for reconcile, don't fake-complete");
+      assert.equal(j.status, "running", "unreachable server must not fake-complete or fail the job");
+      assert.equal(j.awaitingServer, true, "kept alive so a finished answer can still be recovered when the server returns");
     } finally {
       fs.rmSync(ws, { recursive: true, force: true });
     }

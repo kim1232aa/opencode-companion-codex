@@ -484,6 +484,12 @@ export function createClient(baseUrl, opts = {}) {
      */
     getSessionUsage: async (sessionId, opts = {}) => {
       const timeoutMs = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : 300_000;
+      // opts.since (ms epoch): count only turns created at/after it. Without
+      // this, a RESUMED session's trailer summed the PREVIOUS task's turns into
+      // this run's tokens/cost — the previous job already reported those.
+      // Mirrors getSessionResult's rule: with a since-filter active, a turn
+      // with a missing timestamp is treated as pre-dispatch and skipped.
+      const since = typeof opts.since === "number" && opts.since > 0 ? opts.since : 0;
       try {
         const msgs = await request("GET", `/session/${sessionId}/message`, undefined, timeoutMs);
         const list = Array.isArray(msgs) ? msgs : [];
@@ -491,6 +497,7 @@ export function createClient(baseUrl, opts = {}) {
         for (const m of list) {
           const info = m?.info;
           if (!info || info.role !== "assistant") continue;
+          if (since && !((info.time?.created ?? 0) >= since)) continue;
           const t = info.tokens || {};
           const input = t.input || 0;
           const output = t.output || 0;
@@ -545,6 +552,11 @@ export function createClient(baseUrl, opts = {}) {
      */
     getSessionResult: async (sessionId, opts = {}) => {
       const since = typeof opts.since === "number" && opts.since > 0 ? opts.since : 0;
+      // opts.until: upper bound for the dispatch-time window. Two stranded jobs
+      // can share ONE session (--resume-last); without an upper bound the OLDER
+      // job's probe would pick up the NEWER job's answer (latest completed turn
+      // newer than `since`) and persist it as its own result.
+      const until = typeof opts.until === "number" && opts.until > 0 ? opts.until : 0;
       const timeoutMs = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : 300_000;
       try {
         const msgs = await request("GET", `/session/${sessionId}/message`, undefined, timeoutMs);
@@ -560,6 +572,7 @@ export function createClient(baseUrl, opts = {}) {
           // turn whose backend omitted time.created would slip past the filter
           // and be recovered as the current task's answer.
           if (since && (!created || created < since)) continue;
+          if (until && created > until) continue; // a LATER job's turn on a shared session
           const parts = Array.isArray(m.parts) ? m.parts : [];
           const text = parts
             .filter((p) => p?.type === "text")
@@ -579,7 +592,8 @@ export function createClient(baseUrl, opts = {}) {
           // A trailing user message newer than `since` with no answer yet also
           // means the server is still working on our prompt.
           const last = list[list.length - 1]?.info;
-          if (last?.role === "user" && (!since || (last.time?.created ?? 0) >= since)) active = true;
+          const lastCreated = last?.time?.created ?? 0;
+          if (last?.role === "user" && (!since || lastCreated >= since) && (!until || lastCreated <= until)) active = true;
         }
         return { text: doneText, active };
       } catch (err) {
